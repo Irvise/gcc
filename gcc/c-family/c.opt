@@ -2315,11 +2315,11 @@ C ObjC C++ ObjC++ LTO Joined RejectNegative Var(flag_openacc_dims)
 Specify default OpenACC compute dimensions.
 
 fopenmp
-C ObjC C++ ObjC++ LTO Var(flag_openmp)
+C ObjC C++ ObjC++ LTO Ada Var(flag_openmp)
 Enable OpenMP (implies -frecursive in Fortran).
 
 fopenmp-simd
-C ObjC C++ ObjC++ Var(flag_openmp_simd)
+C ObjC C++ ObjC++ Ada Var(flag_openmp_simd)
 Enable OpenMP's SIMD directives.
 
 foperator-names

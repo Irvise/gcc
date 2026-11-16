@@ -987,6 +987,13 @@ omp_copy_decl (tree var, copy_body_data *cb)
   if (is_global_var (var) || decl_function_context (var) != ctx->cb.src_fn)
     return var;
 
+  /* The Ada front end can leave artificial function-scope temporaries
+     (for example sizetype index conversions) referenced from an OMP body.
+     They are not declared inside the construct, so scan_omp cannot install
+     them as locals; privatize them here instead of failing the remap.  */
+  if (DECL_ARTIFICIAL (var))
+    return install_var_local (var, ctx);
+
   return error_mark_node;
 }
 

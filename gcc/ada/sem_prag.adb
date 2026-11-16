@@ -13008,6 +13008,82 @@ package body Sem_Prag is
       --  Deal with unrecognized pragma
 
       if not Is_Pragma_Name (Pname) then
+         --  pragma OpenMP is handled by the Ada front-end/Gigi.  Analyze its
+         --  argument expressions here so that Gigi sees typed nodes, while
+         --  leaving symbolic clause values (Static, Shared, ...) alone.
+         declare
+            Pname_Text : String := Get_Name_String (Pname);
+         begin
+            System.Case_Util.To_Lower (Pname_Text);
+            if Pname_Text = "openmp" or else Pname_Text = "omp" then
+               declare
+                  Arg : Node_Id := First (Pragma_Argument_Associations (N));
+               begin
+                  while Present (Arg) loop
+                     if Present (Expression (Arg)) then
+                        declare
+                           Expr : constant Node_Id := Expression (Arg);
+                           Symbolic : Boolean := False;
+                        begin
+                           if Nkind (Expr) = N_Identifier then
+                              declare
+                                 EName : String :=
+                                   Get_Name_String (Chars (Expr));
+                              begin
+                                 System.Case_Util.To_Lower (EName);
+                                 Symbolic :=
+                                   EName = "static"
+                                   or else EName = "dynamic"
+                                   or else EName = "guided"
+                                   or else EName = "auto"
+                                   or else EName = "runtime"
+                                   or else EName = "shared"
+                                   or else EName = "none"
+                                   or else EName = "private"
+                                   or else EName = "firstprivate"
+                                   or else EName = "primary"
+                                   or else EName = "master"
+                                   or else EName = "close"
+                                   or else EName = "spread"
+                                   or else EName = "true"
+                                   or else EName = "false"
+                                   or else EName = "target"
+                                   or else EName = "parallel_for"
+                                   or else EName = "parallel"
+                                   or else EName = "for"
+                                   or else EName = "nowait"
+                                   or else EName = "ordered"
+                                   or else EName = "untied"
+                                   or else EName = "mergeable";
+                              end;
+                           end if;
+
+                           if not Symbolic then
+                              if Nkind (Expr) = N_Aggregate
+                                and then Present (Expressions (Expr))
+                              then
+                                 declare
+                                    Elem : Node_Id :=
+                                      First (Expressions (Expr));
+                                 begin
+                                    while Present (Elem) loop
+                                       Analyze_And_Resolve (Elem);
+                                       Elem := Next (Elem);
+                                    end loop;
+                                 end;
+                              else
+                                 Analyze_And_Resolve (Expr);
+                              end if;
+                           end if;
+                        end;
+                     end if;
+                     Arg := Next (Arg);
+                  end loop;
+               end;
+               return;
+            end if;
+         end;
+
          declare
             Msg_Issued : Boolean := False;
          begin

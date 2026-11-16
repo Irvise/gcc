@@ -46,11 +46,15 @@
 #include "tree-iterator.h"
 #include "gimplify.h"
 #include "opts.h"
+#include "options.h"
+#include "omp-general.h"
 #include "common/common-target.h"
 #include "gomp-constants.h"
 #include "stringpool.h"
 #include "attribs.h"
 #include "tree-nested.h"
+
+#include <strings.h>
 
 #include "ada.h"
 #include "adadecode.h"
@@ -224,6 +228,22 @@ struct GTY(()) loop_info_d {
 };
 
 typedef struct loop_info_d *loop_info;
+
+/* Pending OpenMP directive attached to the next loop.  */
+struct ada_omp_pending_d {
+  bool active;
+  bool target;
+  bool reverse;
+  tree par_clauses;
+  tree loop_clauses;
+  tree chunk_size;
+  enum tree_code reduction_code;
+};
+
+static ada_omp_pending_d ada_omp_pending;
+
+/* Clause names indexed by enum omp_clause_code (gcc/tree.cc).  */
+extern const char * const omp_clause_code_name[];
 
 /* Stack of loop_info structures associated with LOOP_STMT nodes.  */
 static GTY(()) vec<loop_info, va_gc> *gnu_loop_stack;
@@ -1386,6 +1406,461 @@ Identifier_to_gnu (Node_Id gnat_node, tree *gnu_result_type_p)
   return gnu_result;
 }
 
+/* Return true if GNAT_NODE is a pragma named OpenMP (or omp).  */
+
+static bool
+Is_OpenMP_Pragma (Node_Id gnat_node)
+{
+  if (Nkind (Pragma_Identifier (gnat_node)) != N_Identifier)
+    return false;
+  const char *name = Get_Name_String (Chars (Pragma_Identifier (gnat_node)));
+  return strcasecmp (name, "OpenMP") == 0 || strcasecmp (name, "omp") == 0;
+}
+
+/* Normalize an OpenMP name: lower case, drop underscores and dashes.  */
+
+static void
+OMP_Normalize_Name (const char *name, char *buf, size_t buflen)
+{
+  size_t j = 0;
+  for (; *name != '\0' && j + 1 < buflen; name++)
+    {
+      char c = *name;
+      if (c == '_' || c == '-')
+	continue;
+      if (c >= 'A' && c <= 'Z')
+	c = c - 'A' + 'a';
+      buf[j++] = c;
+    }
+  buf[j] = '\0';
+}
+
+/* Return the omp_clause_code whose user name matches NAME, or
+   OMP_CLAUSE_ERROR.  */
+
+static int
+Find_OpenMP_Clause_Code (const char *name)
+{
+  char want[80];
+  OMP_Normalize_Name (name, want, sizeof want);
+
+  /* Ada reserved words cannot be pragma argument identifiers.  */
+  if (strcmp (want, "condition") == 0
+      || strcmp (want, "ifcondition") == 0)
+    return OMP_CLAUSE_IF;
+
+  for (int code = OMP_CLAUSE_ERROR + 1; code <= OMP_CLAUSE_MESSAGE; code++)
+    {
+      const char *clause_name = omp_clause_code_name[code];
+      char have[80];
+
+      if (clause_name[0] == '_')
+	continue;
+      OMP_Normalize_Name (clause_name, have, sizeof have);
+      if (strcmp (want, have) == 0)
+	return code;
+    }
+  return OMP_CLAUSE_ERROR;
+}
+
+static bool
+OMP_Name_Is (const char *name, const char *literal)
+{
+  char a[40], b[40];
+  OMP_Normalize_Name (name, a, sizeof a);
+  OMP_Normalize_Name (literal, b, sizeof b);
+  return strcmp (a, b) == 0;
+}
+
+static void
+Add_OpenMP_Clause (tree *list, tree clause)
+{
+  OMP_CLAUSE_CHAIN (clause) = *list;
+  *list = clause;
+}
+
+/* Add one clause per declaration in EXPR, which may be a single identifier or
+   an Ada aggregate of identifiers.  */
+
+static void
+Add_OpenMP_Decl_Clauses (Node_Id expr, int code, tree *list)
+{
+  if (Nkind (expr) == N_Aggregate && Present (Expressions (expr)))
+    {
+      Node_Id elem = First (Expressions (expr));
+      while (Present (elem))
+	{
+	  tree decl = gnat_to_gnu (elem);
+	  tree clause = build_omp_clause (input_location,
+					  (enum omp_clause_code) code);
+	  OMP_CLAUSE_DECL (clause) = decl;
+	  Add_OpenMP_Clause (list, clause);
+	  elem = Next (elem);
+	}
+    }
+  else
+    {
+      tree decl = gnat_to_gnu (expr);
+      tree clause = build_omp_clause (input_location,
+				      (enum omp_clause_code) code);
+      OMP_CLAUSE_DECL (clause) = decl;
+      Add_OpenMP_Clause (list, clause);
+    }
+}
+
+/* Map the reduction operator name OP to a tree code.  */
+
+static enum tree_code
+OpenMP_Reduction_Code (const char *op)
+{
+  if (OMP_Name_Is (op, "+") || OMP_Name_Is (op, "Add"))
+    return PLUS_EXPR;
+  if (OMP_Name_Is (op, "-") || OMP_Name_Is (op, "Sub"))
+    return MINUS_EXPR;
+  if (OMP_Name_Is (op, "*") || OMP_Name_Is (op, "Mul"))
+    return MULT_EXPR;
+  if (OMP_Name_Is (op, "max"))
+    return MAX_EXPR;
+  if (OMP_Name_Is (op, "min"))
+    return MIN_EXPR;
+  if (OMP_Name_Is (op, "&") || OMP_Name_Is (op, "And"))
+    return BIT_AND_EXPR;
+  if (OMP_Name_Is (op, "|") || OMP_Name_Is (op, "Or"))
+    return BIT_IOR_EXPR;
+  if (OMP_Name_Is (op, "^") || OMP_Name_Is (op, "Xor"))
+    return BIT_XOR_EXPR;
+  if (OMP_Name_Is (op, "&&") || OMP_Name_Is (op, "And_Then"))
+    return TRUTH_ANDIF_EXPR;
+  if (OMP_Name_Is (op, "||") || OMP_Name_Is (op, "Or_Else"))
+    return TRUTH_ORIF_EXPR;
+  return ERROR_MARK;
+}
+
+static void
+Add_OpenMP_Reduction_Clauses (Node_Id expr, tree *list, enum tree_code rcode)
+{
+  if (Nkind (expr) == N_Aggregate && Present (Expressions (expr)))
+    {
+      Node_Id elem = First (Expressions (expr));
+      while (Present (elem))
+	{
+	  tree decl = gnat_to_gnu (elem);
+	  tree clause = build_omp_clause (input_location,
+					  OMP_CLAUSE_REDUCTION);
+	  OMP_CLAUSE_DECL (clause) = decl;
+	  OMP_CLAUSE_REDUCTION_CODE (clause) = rcode;
+	  Add_OpenMP_Clause (list, clause);
+	  elem = Next (elem);
+	}
+    }
+  else
+    {
+      tree decl = gnat_to_gnu (expr);
+      tree clause = build_omp_clause (input_location, OMP_CLAUSE_REDUCTION);
+      OMP_CLAUSE_DECL (clause) = decl;
+      OMP_CLAUSE_REDUCTION_CODE (clause) = rcode;
+      Add_OpenMP_Clause (list, clause);
+    }
+}
+
+/* Collect artificial function-scope temporaries referenced in an OMP loop
+   body.  Such temporaries must be privatized, like body-local variables in
+   the C front end, otherwise OMP lowering cannot remap them.  */
+
+struct omp_temp_data {
+  tree loop_var;
+  vec<tree> *temps;
+};
+
+static tree
+collect_omp_temporaries (tree *tp, int *walk_subtrees, void *data)
+{
+  tree t = *tp;
+  omp_temp_data *d = (omp_temp_data *) data;
+
+  if (t == NULL_TREE)
+    return NULL_TREE;
+
+  if (VAR_P (t))
+    {
+      if (t != d->loop_var
+	  && DECL_ARTIFICIAL (t)
+	  && DECL_CONTEXT (t) == current_function_decl
+	  && !TREE_STATIC (t)
+	  && !DECL_EXTERNAL (t))
+	{
+	  bool seen = false;
+	  for (unsigned i = 0; i < d->temps->length (); i++)
+	    if ((*d->temps)[i] == t)
+	      {
+		seen = true;
+		break;
+	      }
+	  if (!seen)
+	    d->temps->safe_push (t);
+	}
+      *walk_subtrees = 0;
+    }
+  return NULL_TREE;
+}
+
+/* Record the OpenMP directive of GNAT_NODE for the next loop.  */
+
+static void
+Record_OpenMP_Pragma (Node_Id gnat_node)
+{
+  ada_omp_pending = ada_omp_pending_d ();
+  ada_omp_pending.active = true;
+  ada_omp_pending.reduction_code = PLUS_EXPR;
+
+  for (Node_Id arg = First (Pragma_Argument_Associations (gnat_node));
+       Present (arg); arg = Next (arg))
+    {
+      Node_Id expr = Expression (arg);
+      Name_Id formal = Chars (arg);
+
+      if (formal != No_Name)
+	{
+	  const char *key = Get_Name_String (formal);
+
+	  if (OMP_Name_Is (key, "Chunk_Size"))
+	    {
+	      ada_omp_pending.chunk_size = gnat_to_gnu (expr);
+	      continue;
+	    }
+
+	  if (OMP_Name_Is (key, "Reduction_Op"))
+	    {
+	      const char *op = NULL;
+	      if (Nkind (expr) == N_Identifier)
+		op = Get_Name_String (Chars (expr));
+	      else if (Nkind (expr) == N_String_Literal)
+		op = TREE_STRING_POINTER (gnat_to_gnu (expr));
+	      if (op != NULL)
+		{
+		  enum tree_code code = OpenMP_Reduction_Code (op);
+		  if (code == ERROR_MARK)
+		    post_error ("unsupported OpenMP reduction operator??", expr);
+		  else
+		    ada_omp_pending.reduction_code = code;
+		}
+	      continue;
+	    }
+
+	  int code = Find_OpenMP_Clause_Code (key);
+	  if (code == OMP_CLAUSE_ERROR)
+	    {
+	      post_error ("unsupported OpenMP option??", arg);
+	      continue;
+	    }
+
+	  tree clause = build_omp_clause (input_location,
+					  (enum omp_clause_code) code);
+	  switch (code)
+	    {
+	    case OMP_CLAUSE_NOWAIT:
+	    case OMP_CLAUSE_UNTIED:
+	    case OMP_CLAUSE_MERGEABLE:
+	      Add_OpenMP_Clause (&ada_omp_pending.loop_clauses, clause);
+	      break;
+
+	    case OMP_CLAUSE_ORDERED:
+	      if (Nkind (expr) == N_Integer_Literal)
+		OMP_CLAUSE_ORDERED_EXPR (clause) = gnat_to_gnu (expr);
+	      Add_OpenMP_Clause (&ada_omp_pending.loop_clauses, clause);
+	      break;
+
+	    case OMP_CLAUSE_IF:
+	      OMP_CLAUSE_IF_EXPR (clause) = gnat_to_gnu (expr);
+	      Add_OpenMP_Clause (&ada_omp_pending.par_clauses, clause);
+	      break;
+
+	    case OMP_CLAUSE_NUM_THREADS:
+	      OMP_CLAUSE_NUM_THREADS_EXPR (clause) = gnat_to_gnu (expr);
+	      Add_OpenMP_Clause (&ada_omp_pending.par_clauses, clause);
+	      break;
+
+	    case OMP_CLAUSE_FINAL:
+	      OMP_CLAUSE_FINAL_EXPR (clause) = gnat_to_gnu (expr);
+	      Add_OpenMP_Clause (&ada_omp_pending.par_clauses, clause);
+	      break;
+
+	    case OMP_CLAUSE_COLLAPSE:
+	      OMP_CLAUSE_COLLAPSE_EXPR (clause) = gnat_to_gnu (expr);
+	      Add_OpenMP_Clause (&ada_omp_pending.loop_clauses, clause);
+	      break;
+
+	    case OMP_CLAUSE_SIMDLEN:
+	      OMP_CLAUSE_SIMDLEN_EXPR (clause) = gnat_to_gnu (expr);
+	      Add_OpenMP_Clause (&ada_omp_pending.loop_clauses, clause);
+	      break;
+
+	    case OMP_CLAUSE_SAFELEN:
+	      OMP_CLAUSE_SAFELEN_EXPR (clause) = gnat_to_gnu (expr);
+	      Add_OpenMP_Clause (&ada_omp_pending.loop_clauses, clause);
+	      break;
+
+	    case OMP_CLAUSE_DEFAULT:
+	      {
+		const char *value = NULL;
+		if (Nkind (expr) == N_Identifier)
+		  value = Get_Name_String (Chars (expr));
+		else if (Nkind (expr) == N_String_Literal)
+		  value = TREE_STRING_POINTER (gnat_to_gnu (expr));
+
+		if (value != NULL)
+		  {
+		    if (OMP_Name_Is (value, "Shared"))
+		      OMP_CLAUSE_DEFAULT_KIND (clause) = OMP_CLAUSE_DEFAULT_SHARED;
+		    else if (OMP_Name_Is (value, "None"))
+		      OMP_CLAUSE_DEFAULT_KIND (clause) = OMP_CLAUSE_DEFAULT_NONE;
+		    else if (OMP_Name_Is (value, "Private"))
+		      OMP_CLAUSE_DEFAULT_KIND (clause) = OMP_CLAUSE_DEFAULT_PRIVATE;
+		    else if (OMP_Name_Is (value, "Firstprivate"))
+		      OMP_CLAUSE_DEFAULT_KIND (clause)
+			= OMP_CLAUSE_DEFAULT_FIRSTPRIVATE;
+		    else
+		      post_error ("unsupported OpenMP DEFAULT value??", expr);
+		  }
+		Add_OpenMP_Clause (&ada_omp_pending.par_clauses, clause);
+	      }
+	      break;
+
+	    case OMP_CLAUSE_PROC_BIND:
+	      {
+		const char *value = NULL;
+		if (Nkind (expr) == N_Identifier)
+		  value = Get_Name_String (Chars (expr));
+		else if (Nkind (expr) == N_String_Literal)
+		  value = TREE_STRING_POINTER (gnat_to_gnu (expr));
+
+		if (value != NULL)
+		  {
+		    if (OMP_Name_Is (value, "Primary")
+			|| OMP_Name_Is (value, "Master"))
+		      OMP_CLAUSE_PROC_BIND_KIND (clause)
+			= OMP_CLAUSE_PROC_BIND_PRIMARY;
+		    else if (OMP_Name_Is (value, "Close"))
+		      OMP_CLAUSE_PROC_BIND_KIND (clause)
+			= OMP_CLAUSE_PROC_BIND_CLOSE;
+		    else if (OMP_Name_Is (value, "Spread"))
+		      OMP_CLAUSE_PROC_BIND_KIND (clause)
+			= OMP_CLAUSE_PROC_BIND_SPREAD;
+		    else if (OMP_Name_Is (value, "False"))
+		      OMP_CLAUSE_PROC_BIND_KIND (clause)
+			= OMP_CLAUSE_PROC_BIND_FALSE;
+		    else
+		      post_error ("unsupported OpenMP PROC_BIND value??", expr);
+		  }
+		Add_OpenMP_Clause (&ada_omp_pending.par_clauses, clause);
+	      }
+	      break;
+
+	    case OMP_CLAUSE_SCHEDULE:
+	      {
+		const char *value = NULL;
+		if (Nkind (expr) == N_Identifier)
+		  value = Get_Name_String (Chars (expr));
+		else if (Nkind (expr) == N_String_Literal)
+		  value = TREE_STRING_POINTER (gnat_to_gnu (expr));
+
+		if (value != NULL)
+		  {
+		    if (OMP_Name_Is (value, "Static"))
+		      OMP_CLAUSE_SCHEDULE_KIND (clause)
+			= OMP_CLAUSE_SCHEDULE_STATIC;
+		    else if (OMP_Name_Is (value, "Dynamic"))
+		      OMP_CLAUSE_SCHEDULE_KIND (clause)
+			= OMP_CLAUSE_SCHEDULE_DYNAMIC;
+		    else if (OMP_Name_Is (value, "Guided"))
+		      OMP_CLAUSE_SCHEDULE_KIND (clause)
+			= OMP_CLAUSE_SCHEDULE_GUIDED;
+		    else if (OMP_Name_Is (value, "Auto"))
+		      OMP_CLAUSE_SCHEDULE_KIND (clause)
+			= OMP_CLAUSE_SCHEDULE_AUTO;
+		    else if (OMP_Name_Is (value, "Runtime"))
+		      OMP_CLAUSE_SCHEDULE_KIND (clause)
+			= OMP_CLAUSE_SCHEDULE_RUNTIME;
+		    else
+		      post_error ("unsupported OpenMP SCHEDULE value??", expr);
+		  }
+		Add_OpenMP_Clause (&ada_omp_pending.loop_clauses, clause);
+	      }
+	      break;
+
+	    case OMP_CLAUSE_PRIVATE:
+	    case OMP_CLAUSE_FIRSTPRIVATE:
+	    case OMP_CLAUSE_LASTPRIVATE:
+	      Add_OpenMP_Decl_Clauses (expr, code,
+				       &ada_omp_pending.loop_clauses);
+	      break;
+
+	    case OMP_CLAUSE_SHARED:
+	      Add_OpenMP_Decl_Clauses (expr, code,
+				       &ada_omp_pending.par_clauses);
+	      break;
+
+	    case OMP_CLAUSE_REDUCTION:
+	      Add_OpenMP_Reduction_Clauses (expr,
+					    &ada_omp_pending.loop_clauses,
+					    ada_omp_pending.reduction_code);
+	      break;
+
+	    default:
+	      post_error ("OpenMP clause not yet supported by the Ada front "
+			  "end??", arg);
+	      break;
+	    }
+	}
+      else if (Nkind (expr) == N_Identifier)
+	{
+	  const char *directive = Get_Name_String (Chars (expr));
+
+	  if (OMP_Name_Is (directive, "Target"))
+	    ada_omp_pending.target = true;
+	  else if (OMP_Name_Is (directive, "Parallel_For")
+		   || OMP_Name_Is (directive, "Parallel")
+		   || OMP_Name_Is (directive, "For"))
+	    ;
+	  else
+	    {
+	      int code = Find_OpenMP_Clause_Code (directive);
+	      if (code == OMP_CLAUSE_NOWAIT || code == OMP_CLAUSE_ORDERED
+		  || code == OMP_CLAUSE_UNTIED || code == OMP_CLAUSE_MERGEABLE)
+		{
+		  tree clause = build_omp_clause (input_location,
+						  (enum omp_clause_code) code);
+		  Add_OpenMP_Clause (&ada_omp_pending.loop_clauses, clause);
+		}
+	      else
+		post_error ("unsupported OpenMP directive??", expr);
+	    }
+	}
+      else
+	post_error ("malformed OpenMP pragma??", arg);
+    }
+
+  /* Apply Chunk_Size to the schedule clause, creating a static schedule if
+     the user gave only a chunk size.  */
+  if (ada_omp_pending.chunk_size)
+    {
+      tree sched = omp_find_clause (ada_omp_pending.loop_clauses,
+				    OMP_CLAUSE_SCHEDULE);
+      if (sched == NULL_TREE)
+	{
+	  sched = build_omp_clause (input_location, OMP_CLAUSE_SCHEDULE);
+	  OMP_CLAUSE_SCHEDULE_KIND (sched) = OMP_CLAUSE_SCHEDULE_STATIC;
+	  Add_OpenMP_Clause (&ada_omp_pending.loop_clauses, sched);
+	}
+      OMP_CLAUSE_SCHEDULE_CHUNK_EXPR (sched) = ada_omp_pending.chunk_size;
+    }
+
+  /* Reduction_Op may appear before or after Reduction.  */
+  for (tree c = ada_omp_pending.loop_clauses; c; c = OMP_CLAUSE_CHAIN (c))
+    if (OMP_CLAUSE_CODE (c) == OMP_CLAUSE_REDUCTION)
+      OMP_CLAUSE_REDUCTION_CODE (c) = ada_omp_pending.reduction_code;
+}
+
 /* Subroutine of gnat_to_gnu to translate GNAT_NODE, an N_Pragma, to a GCC
    tree, which is returned.  */
 
@@ -1394,6 +1869,17 @@ Pragma_to_gnu (Node_Id gnat_node)
 {
   tree gnu_result = alloc_stmt_list ();
   Node_Id gnat_temp;
+
+  if (Is_OpenMP_Pragma (gnat_node))
+    {
+      if (!flag_openmp)
+	{
+	  post_error ("pragma OpenMP requires -fopenmp??", gnat_node);
+	  return gnu_result;
+	}
+      Record_OpenMP_Pragma (gnat_node);
+      return gnu_result;
+    }
 
   /* Check for (and ignore) unrecognized pragmas.  */
   if (!Is_Pragma_Name (Chars (Pragma_Identifier (gnat_node))))
@@ -3042,6 +3528,7 @@ Loop_Statement_to_gnu (Node_Id gnat_node)
   tree gnu_loop_label = create_artificial_label (input_location);
   tree gnu_cond_expr = NULL_TREE, gnu_low = NULL_TREE, gnu_high = NULL_TREE;
   tree gnu_result;
+  bool omp_loop = false;
 
   /* Push the loop_info structure associated with the LOOP_STMT.  */
   gnu_loop_info->fndecl = current_function_decl;
@@ -3084,6 +3571,9 @@ Loop_Statement_to_gnu (Node_Id gnat_node)
       tree gnu_loop_var, gnu_loop_iv, gnu_first, gnu_last, gnu_stmt;
       enum tree_code update_code, test_code, shift_code;
       bool reverse = Reverse_Present (gnat_loop_spec), use_iv = false;
+      omp_loop = ada_omp_pending.active;
+      if (omp_loop)
+	ada_omp_pending.reverse = reverse;
 
       gnu_low = convert (gnu_base_type, TYPE_MIN_VALUE (gnu_type));
       gnu_high = convert (gnu_base_type, TYPE_MAX_VALUE (gnu_type));
@@ -3156,6 +3646,8 @@ Loop_Statement_to_gnu (Node_Id gnat_node)
 
 	 which works in all cases.  */
 
+      if (!omp_loop)
+	{
       if (optimize
 	  && !optimize_debug
 	  && TREE_CODE (gnu_base_type) != BOOLEAN_TYPE)
@@ -3213,6 +3705,7 @@ Loop_Statement_to_gnu (Node_Id gnat_node)
 	  /* Otherwise, use the fallback form.  */
 	  else
 	    LOOP_STMT_BOTTOM_COND_P (gnu_loop_stmt) = 1;
+	}
 	}
 
       /* If we use the BOTTOM_COND, we can turn the test into an inequality
@@ -3314,6 +3807,74 @@ Loop_Statement_to_gnu (Node_Id gnat_node)
     = build_stmt_group (Statements (gnat_node), true);
   TREE_SIDE_EFFECTS (gnu_loop_stmt) = 1;
 
+  /* If an OpenMP pragma is pending, turn the body and canonical iteration
+     into an OMP_FOR wrapped in an OMP_PARALLEL.  */
+  if (omp_loop)
+    {
+      tree var = gnu_loop_info->loop_var;
+      tree type = TREE_TYPE (var);
+      tree low = convert (type, gnu_loop_info->low_bound);
+      tree high = convert (type, gnu_loop_info->high_bound);
+      tree one = build_int_cst (type, 1);
+      tree clauses = ada_omp_pending.loop_clauses, c;
+      tree init = make_tree_vec (1);
+      tree cond = make_tree_vec (1);
+      tree incr = make_tree_vec (1);
+      tree for_stmt, par;
+
+      if (ada_omp_pending.target)
+	post_error ("native OpenMP target regions are not implemented yet??",
+		    gnat_node);
+
+      c = build_omp_clause (input_location, OMP_CLAUSE_PRIVATE);
+      OMP_CLAUSE_DECL (c) = var;
+      OMP_CLAUSE_CHAIN (c) = clauses;
+      clauses = c;
+
+      /* Privatize artificial temporaries created in the body (Ada indexing
+	 conversions often introduce function-scope sizetype temporaries).  */
+      tree body = LOOP_STMT_BODY (gnu_loop_stmt);
+      auto_vec<tree> omp_temps;
+      omp_temp_data temp_data = { var, &omp_temps };
+      walk_tree (&body, collect_omp_temporaries, &temp_data, NULL);
+      for (unsigned i = 0; i < omp_temps.length (); i++)
+	{
+	  c = build_omp_clause (input_location, OMP_CLAUSE_PRIVATE);
+	  OMP_CLAUSE_DECL (c) = omp_temps[i];
+	  OMP_CLAUSE_CHAIN (c) = clauses;
+	  clauses = c;
+	}
+
+      TREE_VEC_ELT (init, 0) = build2 (MODIFY_EXPR, type, var, low);
+      TREE_VEC_ELT (cond, 0)
+	= build2 (ada_omp_pending.reverse ? GE_EXPR : LE_EXPR,
+		  boolean_type_node, var, high);
+      TREE_VEC_ELT (incr, 0)
+	= build2 (MODIFY_EXPR, type, var,
+		  build2 (ada_omp_pending.reverse ? MINUS_EXPR : PLUS_EXPR,
+			  type, var, one));
+
+      for_stmt = make_node (OMP_FOR);
+      TREE_TYPE (for_stmt) = void_type_node;
+      SET_EXPR_LOCATION (for_stmt, input_location);
+      OMP_FOR_BODY (for_stmt) = body;
+      OMP_FOR_CLAUSES (for_stmt) = clauses;
+      OMP_FOR_INIT (for_stmt) = init;
+      OMP_FOR_COND (for_stmt) = cond;
+      OMP_FOR_INCR (for_stmt) = incr;
+
+      par = make_node (OMP_PARALLEL);
+      TREE_TYPE (par) = void_type_node;
+      SET_EXPR_LOCATION (par, input_location);
+      tree par_body = build3 (BIND_EXPR, void_type_node, NULL_TREE,
+			      for_stmt, NULL_TREE);
+      TREE_SIDE_EFFECTS (par_body) = 1;
+      OMP_PARALLEL_BODY (par) = par_body;
+      OMP_PARALLEL_CLAUSES (par) = ada_omp_pending.par_clauses;
+      gnu_loop_stmt = par;
+      ada_omp_pending = ada_omp_pending_d ();
+    }
+
   /* If we have an iteration scheme, then we are in a statement group.  Add
      the LOOP_STMT to it, finish it and make it the "loop".  */
   if (Present (gnat_iter_scheme) && No (Condition (gnat_iter_scheme)))
@@ -3401,7 +3962,8 @@ Loop_Statement_to_gnu (Node_Id gnat_node)
 
       /* Third, if loop vectorization is enabled and the iterations of the
 	 loop can easily be proved as independent, mark the loop.  */
-      if (optimize >= 3
+      if (!omp_loop
+	  && optimize >= 3
 	  && independent_iterations_p (LOOP_STMT_BODY (gnu_loop_stmt)))
 	LOOP_STMT_IVDEP (gnu_loop_stmt) = 1;
 
