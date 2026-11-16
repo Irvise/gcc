@@ -3822,10 +3822,6 @@ Loop_Statement_to_gnu (Node_Id gnat_node)
       tree incr = make_tree_vec (1);
       tree for_stmt, par;
 
-      if (ada_omp_pending.target)
-	post_error ("native OpenMP target regions are not implemented yet??",
-		    gnat_node);
-
       c = build_omp_clause (input_location, OMP_CLAUSE_PRIVATE);
       OMP_CLAUSE_DECL (c) = var;
       OMP_CLAUSE_CHAIN (c) = clauses;
@@ -3871,7 +3867,23 @@ Loop_Statement_to_gnu (Node_Id gnat_node)
       TREE_SIDE_EFFECTS (par_body) = 1;
       OMP_PARALLEL_BODY (par) = par_body;
       OMP_PARALLEL_CLAUSES (par) = ada_omp_pending.par_clauses;
-      gnu_loop_stmt = par;
+
+      /* Wrap in a target region if requested.  Map clauses are implicit for
+	 now; GCC's target lowering maps referenced variables.  */
+      if (ada_omp_pending.target)
+	{
+	  tree target = make_node (OMP_TARGET);
+	  TREE_TYPE (target) = void_type_node;
+	  SET_EXPR_LOCATION (target, input_location);
+	  tree target_body = build3 (BIND_EXPR, void_type_node, NULL_TREE,
+				     par, NULL_TREE);
+	  TREE_SIDE_EFFECTS (target_body) = 1;
+	  OMP_TARGET_BODY (target) = target_body;
+	  OMP_TARGET_CLAUSES (target) = NULL_TREE;
+	  gnu_loop_stmt = target;
+	}
+      else
+	gnu_loop_stmt = par;
       ada_omp_pending = ada_omp_pending_d ();
     }
 
