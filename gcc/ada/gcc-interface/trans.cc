@@ -243,11 +243,13 @@ enum ada_omp_directive {
 struct ada_omp_pending_d {
   bool active;
   bool target;
+  bool teams;
   bool reverse;
   enum ada_omp_directive directive;
   tree par_clauses;
   tree loop_clauses;
   tree target_clauses;
+  tree teams_clauses;
   tree chunk_size;
   enum tree_code reduction_code;
 };
@@ -1730,6 +1732,19 @@ Record_OpenMP_Pragma (Node_Id gnat_node)
 	      Add_OpenMP_Clause (&ada_omp_pending.loop_clauses, clause);
 	      break;
 
+	    case OMP_CLAUSE_NUM_TEAMS:
+	      OMP_CLAUSE_NUM_TEAMS_UPPER_EXPR (clause)
+		= gnat_to_gnu (expr);
+	      OMP_CLAUSE_NUM_TEAMS_LOWER_EXPR (clause)
+		= build_int_cst (integer_type_node, 1);
+	      Add_OpenMP_Clause (&ada_omp_pending.teams_clauses, clause);
+	      break;
+
+	    case OMP_CLAUSE_THREAD_LIMIT:
+	      OMP_CLAUSE_THREAD_LIMIT_EXPR (clause) = gnat_to_gnu (expr);
+	      Add_OpenMP_Clause (&ada_omp_pending.teams_clauses, clause);
+	      break;
+
 	    case OMP_CLAUSE_IF:
 	      OMP_CLAUSE_IF_EXPR (clause) = gnat_to_gnu (expr);
 	      Add_OpenMP_Clause (&ada_omp_pending.par_clauses, clause);
@@ -1916,6 +1931,8 @@ Record_OpenMP_Pragma (Node_Id gnat_node)
 
 	  if (OMP_Name_Is (directive, "Target"))
 	    ada_omp_pending.target = true;
+	  else if (OMP_Name_Is (directive, "Teams"))
+	    ada_omp_pending.teams = true;
 	  else if (OMP_Name_Is (directive, "Simd"))
 	    ada_omp_pending.directive = ADA_OMP_SIMD;
 	  else if (OMP_Name_Is (directive, "For_Simd")
@@ -3996,6 +4013,22 @@ Loop_Statement_to_gnu (Node_Id gnat_node)
 	  OMP_PARALLEL_BODY (par) = par_body;
 	  OMP_PARALLEL_CLAUSES (par) = ada_omp_pending.par_clauses;
 	  top = par;
+	}
+
+      /* gpGPU mapping: teams region around the parallel loop.  */
+      if (ada_omp_pending.teams)
+	{
+	  tree teams = make_node (OMP_TEAMS);
+	  tree teams_body;
+	  TREE_TYPE (teams) = void_type_node;
+	  SET_EXPR_LOCATION (teams, input_location);
+	  teams_body = build3 (BIND_EXPR, void_type_node, NULL_TREE, top,
+			       NULL_TREE);
+	  TREE_SIDE_EFFECTS (teams_body) = 1;
+	  OMP_TEAMS_BODY (teams) = teams_body;
+	  OMP_TEAMS_CLAUSES (teams) = ada_omp_pending.teams_clauses;
+	  TREE_SIDE_EFFECTS (teams) = 1;
+	  top = teams;
 	}
 
       /* Wrap in a target region if requested.  Map clauses are implicit for
