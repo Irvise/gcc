@@ -1502,6 +1502,8 @@ Add_OpenMP_Decl_Clauses (Node_Id expr, int code, tree *list)
 	  tree clause = build_omp_clause (input_location,
 					  (enum omp_clause_code) code);
 	  OMP_CLAUSE_DECL (clause) = decl;
+	  if (code == OMP_CLAUSE_LINEAR)
+	    OMP_CLAUSE_LINEAR_STEP (clause) = integer_one_node;
 	  Add_OpenMP_Clause (list, clause);
 	  elem = Next (elem);
 	}
@@ -1512,6 +1514,8 @@ Add_OpenMP_Decl_Clauses (Node_Id expr, int code, tree *list)
       tree clause = build_omp_clause (input_location,
 				      (enum omp_clause_code) code);
       OMP_CLAUSE_DECL (clause) = decl;
+      if (code == OMP_CLAUSE_LINEAR)
+	OMP_CLAUSE_LINEAR_STEP (clause) = integer_one_node;
       Add_OpenMP_Clause (list, clause);
     }
 }
@@ -1813,6 +1817,17 @@ Record_OpenMP_Pragma (Node_Id gnat_node)
 	      Add_OpenMP_Reduction_Clauses (expr,
 					    &ada_omp_pending.loop_clauses,
 					    ada_omp_pending.reduction_code);
+	      break;
+
+	    case OMP_CLAUSE_LINEAR:
+	    case OMP_CLAUSE_ALIGNED:
+	      Add_OpenMP_Decl_Clauses (expr, code,
+				       &ada_omp_pending.loop_clauses);
+	      break;
+
+	    case OMP_CLAUSE_COPYIN:
+	      Add_OpenMP_Decl_Clauses (expr, code,
+				       &ada_omp_pending.par_clauses);
 	      break;
 
 	    default:
