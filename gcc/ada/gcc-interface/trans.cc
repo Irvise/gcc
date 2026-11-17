@@ -1608,6 +1608,24 @@ Is_OpenMP_Mappable_Array (tree decl)
 	  && DECL_CONTEXT (decl) == current_function_decl);
 }
 
+/* Collect the declarations that belong to a BIND_EXPR nested in an OpenMP
+   region body.  Such variables are declared inside the region, so the middle
+   end privatizes them by itself and they must not be listed explicitly.  */
+
+static tree
+collect_omp_body_decls (tree *tp, int *walk_subtrees, void *data)
+{
+  tree t = *tp;
+  auto_vec<tree> *decls = (auto_vec<tree> *) data;
+
+  if (t != NULL_TREE && TREE_CODE (t) == BIND_EXPR)
+    for (tree v = BIND_EXPR_VARS (t); v; v = DECL_CHAIN (v))
+      decls->safe_push (v);
+
+  *walk_subtrees = 1;
+  return NULL_TREE;
+}
+
 /* Collect the local arrays referenced by an OpenMP target body.  */
 
 static tree
@@ -4154,13 +4172,24 @@ Loop_Statement_to_gnu (Node_Id gnat_node)
 	 for the region and must stay shared: privatizing them conflicts with
 	 the middle end's own firstprivate treatment of type sizes.  */
       tree body = LOOP_STMT_BODY (gnu_loop_stmt);
-      auto_vec<tree> omp_temps;
+      auto_vec<tree> omp_temps, omp_body_decls;
       omp_temp_data temp_data = { var, &omp_temps };
       walk_tree (&body, collect_omp_temporaries, &temp_data, NULL);
+      walk_tree (&body, collect_omp_body_decls, &omp_body_decls, NULL);
       for (unsigned i = 0; i < omp_temps.length (); i++)
 	{
+	  bool in_body = false;
+
 	  if (DECL_INITIAL (omp_temps[i]) != NULL_TREE
 	      && TREE_READONLY (omp_temps[i]))
+	    continue;
+	  for (unsigned j = 0; j < omp_body_decls.length (); j++)
+	    if (omp_body_decls[j] == omp_temps[i])
+	      {
+		in_body = true;
+		break;
+	      }
+	  if (in_body)
 	    continue;
 	  c = build_omp_clause (input_location, OMP_CLAUSE_PRIVATE);
 	  OMP_CLAUSE_DECL (c) = omp_temps[i];
@@ -4242,6 +4271,26 @@ Loop_Statement_to_gnu (Node_Id gnat_node)
 	      if (clause != NULL_TREE)
 		Add_OpenMP_Clause (&ada_omp_pending.target_clauses, clause);
 	    }
+
+	  /* A reduction variable of the inner parallel loop lives in the
+	     target region; map it back so the result is visible after the
+	     region.  */
+	  for (tree rc = ada_omp_pending.loop_clauses; rc;
+	       rc = OMP_CLAUSE_CHAIN (rc))
+	    if (OMP_CLAUSE_CODE (rc) == OMP_CLAUSE_REDUCTION)
+	      {
+		tree rdecl = OMP_CLAUSE_DECL (rc);
+		tree size = DECL_P (rdecl) ? DECL_SIZE_UNIT (rdecl) : NULL_TREE;
+		tree clause;
+
+		if (OpenMP_Map_Listed_P (ada_omp_pending.target_clauses,
+					 rdecl))
+		  continue;
+		clause = Build_OpenMP_Map_Clause_1 (rdecl, size,
+						    GOMP_MAP_TOFROM);
+		if (clause != NULL_TREE)
+		  Add_OpenMP_Clause (&ada_omp_pending.target_clauses, clause);
+	      }
 
 	  tree target = make_node (OMP_TARGET);
 	  TREE_TYPE (target) = void_type_node;
