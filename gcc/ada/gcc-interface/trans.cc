@@ -1528,7 +1528,7 @@ Add_OpenMP_Decl_Clauses (Node_Id expr, int code, tree *list)
    implementation maps every listed object to/from the device.  */
 
 static void
-Add_OpenMP_Map_Clauses (Node_Id expr, tree *list)
+Add_OpenMP_Map_Clauses (Node_Id expr, tree *list, enum gomp_map_kind kind)
 {
   auto add_one = [&] (Node_Id elem) {
     tree decl = gnat_to_gnu (elem);
@@ -1542,7 +1542,7 @@ Add_OpenMP_Map_Clauses (Node_Id expr, tree *list)
 	return;
       }
     OMP_CLAUSE_DECL (clause) = decl;
-    OMP_CLAUSE_SET_MAP_KIND (clause, GOMP_MAP_TOFROM);
+    OMP_CLAUSE_SET_MAP_KIND (clause, kind);
     OMP_CLAUSE_SIZE (clause) = size;
     Add_OpenMP_Clause (list, clause);
   };
@@ -1696,6 +1696,14 @@ Record_OpenMP_Pragma (Node_Id gnat_node)
 		  else
 		    ada_omp_pending.reduction_code = code;
 		}
+	      continue;
+	    }
+
+	  if (OMP_Name_Is (key, "ToFrom"))
+	    {
+	      Add_OpenMP_Map_Clauses (expr,
+				      &ada_omp_pending.target_clauses,
+				      GOMP_MAP_TOFROM);
 	      continue;
 	    }
 
@@ -1871,7 +1879,20 @@ Record_OpenMP_Pragma (Node_Id gnat_node)
 
 	    case OMP_CLAUSE_MAP:
 	      Add_OpenMP_Map_Clauses (expr,
-				      &ada_omp_pending.target_clauses);
+				      &ada_omp_pending.target_clauses,
+				      GOMP_MAP_TOFROM);
+	      break;
+
+	    case OMP_CLAUSE_TO:
+	      Add_OpenMP_Map_Clauses (expr,
+				      &ada_omp_pending.target_clauses,
+				      GOMP_MAP_TO);
+	      break;
+
+	    case OMP_CLAUSE_FROM:
+	      Add_OpenMP_Map_Clauses (expr,
+				      &ada_omp_pending.target_clauses,
+				      GOMP_MAP_FROM);
 	      break;
 
 	    case OMP_CLAUSE_DEVICE:
