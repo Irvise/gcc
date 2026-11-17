@@ -4208,17 +4208,49 @@ Loop_Statement_to_gnu (Node_Id gnat_node)
 
       bool simd = ada_omp_pending.directive == ADA_OMP_SIMD
 	|| ada_omp_pending.directive == ADA_OMP_PARALLEL_FOR_SIMD;
+      bool parallel_simd
+	= ada_omp_pending.directive == ADA_OMP_PARALLEL_FOR_SIMD;
       bool parallel_region = ada_omp_pending.directive == ADA_OMP_PARALLEL_FOR
 	|| ada_omp_pending.directive == ADA_OMP_PARALLEL_FOR_SIMD;
 
-      for_stmt = make_node (simd ? OMP_SIMD : OMP_FOR);
+      /* A combined "parallel for simd" is a worksharing loop whose body is a
+	 SIMD loop, as produced by the C front end: the outer loop distributes
+	 the iterations, the inner one vectorizes them.  */
+      for_stmt = make_node (simd && !parallel_simd ? OMP_SIMD : OMP_FOR);
       TREE_TYPE (for_stmt) = void_type_node;
       SET_EXPR_LOCATION (for_stmt, input_location);
       OMP_FOR_BODY (for_stmt) = body;
       OMP_FOR_CLAUSES (for_stmt) = clauses;
-      OMP_FOR_INIT (for_stmt) = init;
-      OMP_FOR_COND (for_stmt) = cond;
-      OMP_FOR_INCR (for_stmt) = incr;
+
+      if (parallel_simd)
+	{
+	  /* Combined construct: the outer node only carries the clauses, the
+	     iteration specification and body live in the SIMD child.  The
+	     gimplifier merges them into one combined loop.  */
+	  tree simd_stmt = make_node (OMP_SIMD);
+	  TREE_TYPE (simd_stmt) = void_type_node;
+	  SET_EXPR_LOCATION (simd_stmt, input_location);
+	  OMP_FOR_BODY (simd_stmt) = body;
+	  OMP_FOR_CLAUSES (simd_stmt) = NULL_TREE;
+	  OMP_FOR_INIT (simd_stmt) = init;
+	  OMP_FOR_COND (simd_stmt) = cond;
+	  OMP_FOR_INCR (simd_stmt) = incr;
+	  TREE_SIDE_EFFECTS (simd_stmt) = 1;
+
+	  tree simd_body = build3 (BIND_EXPR, void_type_node, NULL_TREE,
+				   simd_stmt, NULL_TREE);
+	  TREE_SIDE_EFFECTS (simd_body) = 1;
+	  OMP_FOR_BODY (for_stmt) = simd_body;
+	  OMP_FOR_INIT (for_stmt) = NULL_TREE;
+	  OMP_FOR_COND (for_stmt) = NULL_TREE;
+	  OMP_FOR_INCR (for_stmt) = NULL_TREE;
+	}
+      else
+	{
+	  OMP_FOR_INIT (for_stmt) = init;
+	  OMP_FOR_COND (for_stmt) = cond;
+	  OMP_FOR_INCR (for_stmt) = incr;
+	}
 
       tree top = for_stmt;
       if (parallel_region)
