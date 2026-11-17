@@ -1656,6 +1656,84 @@ collect_omp_mappable_arrays (tree *tp, int *walk_subtrees, void *data)
   return NULL_TREE;
 }
 
+/* Classify uses of DECL in a target-region body: in_lhs is true while
+   visiting the destination of an assignment.  Used to choose between
+   map(to:), map(from:) and map(tofrom:).  */
+
+static void
+Scan_OpenMP_Array_Use (tree t, tree decl, bool in_lhs,
+		       bool *read_p, bool *write_p)
+{
+  if (t == NULL_TREE || t == error_mark_node)
+    return;
+
+  if (t == decl)
+    {
+      if (in_lhs)
+	*write_p = true;
+      else
+	*read_p = true;
+      return;
+    }
+
+  if (DECL_P (t))
+    return;
+
+  switch (TREE_CODE (t))
+    {
+    case MODIFY_EXPR:
+    case INIT_EXPR:
+      Scan_OpenMP_Array_Use (TREE_OPERAND (t, 0), decl, true, read_p, write_p);
+      Scan_OpenMP_Array_Use (TREE_OPERAND (t, 1), decl, false, read_p, write_p);
+      return;
+
+    case ARRAY_REF:
+    case ARRAY_RANGE_REF:
+      Scan_OpenMP_Array_Use (TREE_OPERAND (t, 0), decl, in_lhs,
+			     read_p, write_p);
+      for (int i = 1; i < TREE_OPERAND_LENGTH (t); i++)
+	Scan_OpenMP_Array_Use (TREE_OPERAND (t, i), decl, false,
+			       read_p, write_p);
+      return;
+
+    case COMPONENT_REF:
+    case MEM_REF:
+    case INDIRECT_REF:
+      Scan_OpenMP_Array_Use (TREE_OPERAND (t, 0), decl, in_lhs,
+			     read_p, write_p);
+      for (int i = 1; i < TREE_OPERAND_LENGTH (t); i++)
+	Scan_OpenMP_Array_Use (TREE_OPERAND (t, i), decl, false,
+			       read_p, write_p);
+      return;
+
+    case STATEMENT_LIST:
+      for (tree_stmt_iterator i = tsi_start (t); !tsi_end_p (i); tsi_next (&i))
+	Scan_OpenMP_Array_Use (tsi_stmt (i), decl, false, read_p, write_p);
+      return;
+
+    case BIND_EXPR:
+      for (tree v = BIND_EXPR_VARS (t); v; v = DECL_CHAIN (v))
+	if (DECL_INITIAL (v))
+	  Scan_OpenMP_Array_Use (DECL_INITIAL (v), decl, false,
+				 read_p, write_p);
+      Scan_OpenMP_Array_Use (BIND_EXPR_BODY (t), decl, false,
+			     read_p, write_p);
+      return;
+
+    case DECL_EXPR:
+      if (DECL_INITIAL (DECL_EXPR_DECL (t)))
+	Scan_OpenMP_Array_Use (DECL_INITIAL (DECL_EXPR_DECL (t)), decl,
+			       false, read_p, write_p);
+      return;
+
+    default:
+      for (int i = 0; i < TREE_OPERAND_LENGTH (t); i++)
+	Scan_OpenMP_Array_Use (TREE_OPERAND (t, i), decl, false,
+			       read_p, write_p);
+      return;
+    }
+}
+
 /* Substitution data for rewriting an array through a pointer alias.  */
 
 struct omp_array_subst {
@@ -1682,7 +1760,7 @@ substitute_omp_array (tree *tp, int *walk_subtrees, void *data)
    the pointee, as in the C map(p[0:n]) form.  */
 
 static tree
-Alias_OpenMP_Target_Array (tree arr, tree *body)
+Alias_OpenMP_Target_Array (tree arr, tree *body, enum gomp_map_kind kind)
 {
   tree arr_type = TREE_TYPE (arr);
   tree ptr_type;
@@ -1708,8 +1786,7 @@ Alias_OpenMP_Target_Array (tree arr, tree *body)
   walk_tree (body, substitute_omp_array, &subst, NULL);
   add_stmt (build_binary_op (MODIFY_EXPR, NULL_TREE, ptr, ptr_expr));
 
-  return Build_OpenMP_Map_Clause_1 (subst.to, DECL_SIZE_UNIT (arr),
-				    GOMP_MAP_TOFROM);
+  return Build_OpenMP_Map_Clause_1 (subst.to, DECL_SIZE_UNIT (arr), kind);
 }
 
 /* Add map clauses for an Ada aggregate of array/scalar names.  The initial
@@ -4322,9 +4399,23 @@ Loop_Statement_to_gnu (Node_Id gnat_node)
 	      if (OpenMP_Map_Listed_P (omp.target_clauses, arr))
 		continue;
 
+	      bool read_p = false, write_p = false;
+	      enum gomp_map_kind kind;
+
+	      Scan_OpenMP_Array_Use (body, arr, false, &read_p, &write_p);
+	      if (read_p && write_p)
+		kind = GOMP_MAP_TOFROM;
+	      else if (read_p)
+		kind = GOMP_MAP_TO;
+	      else if (write_p)
+		kind = GOMP_MAP_FROM;
+	      else
+		kind = GOMP_MAP_TOFROM;
+
+
 	      clause = (gnat_omp_current_function_has_nested_subprogram ()
-			? Alias_OpenMP_Target_Array (arr, &body)
-			: Build_OpenMP_Map_Clause (arr, GOMP_MAP_TOFROM));
+			? Alias_OpenMP_Target_Array (arr, &body, kind)
+			: Build_OpenMP_Map_Clause (arr, kind));
 
 	      if (clause != NULL_TREE)
 		Add_OpenMP_Clause (&omp.target_clauses, clause);
