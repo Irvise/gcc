@@ -3866,6 +3866,7 @@ Loop_Statement_to_gnu (Node_Id gnat_node)
   tree gnu_cond_expr = NULL_TREE, gnu_low = NULL_TREE, gnu_high = NULL_TREE;
   tree gnu_result;
   bool omp_loop = false;
+  ada_omp_pending_d omp = ada_omp_pending;
 
   /* Push the loop_info structure associated with the LOOP_STMT.  */
   gnu_loop_info->fndecl = current_function_decl;
@@ -3908,14 +3909,18 @@ Loop_Statement_to_gnu (Node_Id gnat_node)
       tree gnu_loop_var, gnu_loop_iv, gnu_first, gnu_last, gnu_stmt;
       enum tree_code update_code, test_code, shift_code;
       bool reverse = Reverse_Present (gnat_loop_spec), use_iv = false;
-      omp_loop = ada_omp_pending.active;
+      omp_loop = omp.active;
       /* Consume the directive now: the loop body may contain nested loops
-	 that must not be turned into OpenMP loops themselves.  The remaining
-	 fields are still needed below to build the construct.  */
+	 (and nested pragmas) that must not be attached to this loop.  The
+	 directive is saved in OMP above, so a nested pragma resetting the
+	 global state cannot change the construct being built.  */
       if (omp_loop)
-	ada_omp_pending.active = false;
+	{
+	  omp.active = false;
+	  omp.active = false;
+	}
       if (omp_loop)
-	ada_omp_pending.reverse = reverse;
+	omp.reverse = reverse;
 
       gnu_low = convert (gnu_base_type, TYPE_MIN_VALUE (gnu_type));
       gnu_high = convert (gnu_base_type, TYPE_MAX_VALUE (gnu_type));
@@ -4158,7 +4163,7 @@ Loop_Statement_to_gnu (Node_Id gnat_node)
       tree low = convert (type, gnu_loop_info->low_bound);
       tree high = convert (type, gnu_loop_info->high_bound);
       tree one = build_int_cst (type, 1);
-      tree clauses = ada_omp_pending.loop_clauses, c;
+      tree clauses = omp.loop_clauses, c;
       tree init = make_tree_vec (1);
       tree cond = make_tree_vec (1);
       tree incr = make_tree_vec (1);
@@ -4202,22 +4207,22 @@ Loop_Statement_to_gnu (Node_Id gnat_node)
 
       TREE_VEC_ELT (init, 0)
 	= build2 (MODIFY_EXPR, type, var,
-		  ada_omp_pending.reverse ? high : low);
+		  omp.reverse ? high : low);
       TREE_VEC_ELT (cond, 0)
-	= build2 (ada_omp_pending.reverse ? GE_EXPR : LE_EXPR,
+	= build2 (omp.reverse ? GE_EXPR : LE_EXPR,
 		  boolean_type_node, var,
-		  ada_omp_pending.reverse ? low : high);
+		  omp.reverse ? low : high);
       TREE_VEC_ELT (incr, 0)
 	= build2 (MODIFY_EXPR, type, var,
-		  build2 (ada_omp_pending.reverse ? MINUS_EXPR : PLUS_EXPR,
+		  build2 (omp.reverse ? MINUS_EXPR : PLUS_EXPR,
 			  type, var, one));
 
-      bool simd = ada_omp_pending.directive == ADA_OMP_SIMD
-	|| ada_omp_pending.directive == ADA_OMP_PARALLEL_FOR_SIMD;
+      bool simd = omp.directive == ADA_OMP_SIMD
+	|| omp.directive == ADA_OMP_PARALLEL_FOR_SIMD;
       bool parallel_simd
-	= ada_omp_pending.directive == ADA_OMP_PARALLEL_FOR_SIMD;
-      bool parallel_region = ada_omp_pending.directive == ADA_OMP_PARALLEL_FOR
-	|| ada_omp_pending.directive == ADA_OMP_PARALLEL_FOR_SIMD;
+	= omp.directive == ADA_OMP_PARALLEL_FOR_SIMD;
+      bool parallel_region = omp.directive == ADA_OMP_PARALLEL_FOR
+	|| omp.directive == ADA_OMP_PARALLEL_FOR_SIMD;
 
       /* A combined "parallel for simd" is a worksharing loop whose body is a
 	 SIMD loop, as produced by the C front end: the outer loop distributes
@@ -4268,12 +4273,12 @@ Loop_Statement_to_gnu (Node_Id gnat_node)
 				  for_stmt, NULL_TREE);
 	  TREE_SIDE_EFFECTS (par_body) = 1;
 	  OMP_PARALLEL_BODY (par) = par_body;
-	  OMP_PARALLEL_CLAUSES (par) = ada_omp_pending.par_clauses;
+	  OMP_PARALLEL_CLAUSES (par) = omp.par_clauses;
 	  top = par;
 	}
 
       /* gpGPU mapping: teams region around the parallel loop.  */
-      if (ada_omp_pending.teams)
+      if (omp.teams)
 	{
 	  tree teams = make_node (OMP_TEAMS);
 	  tree teams_body;
@@ -4283,7 +4288,7 @@ Loop_Statement_to_gnu (Node_Id gnat_node)
 			       NULL_TREE);
 	  TREE_SIDE_EFFECTS (teams_body) = 1;
 	  OMP_TEAMS_BODY (teams) = teams_body;
-	  OMP_TEAMS_CLAUSES (teams) = ada_omp_pending.teams_clauses;
+	  OMP_TEAMS_CLAUSES (teams) = omp.teams_clauses;
 	  TREE_SIDE_EFFECTS (teams) = 1;
 	  top = teams;
 	}
@@ -4292,7 +4297,7 @@ Loop_Statement_to_gnu (Node_Id gnat_node)
 	 map clauses: unlike C and Fortran, an Ada array can be represented as
 	 a pointer inside a frame record, which the implicit mapping in the
 	 middle end cannot handle.  */
-      if (ada_omp_pending.target)
+      if (omp.target)
 	{
 	  auto_vec<tree> omp_arrays;
 	  walk_tree (&body, collect_omp_mappable_arrays, &omp_arrays, NULL);
@@ -4301,19 +4306,19 @@ Loop_Statement_to_gnu (Node_Id gnat_node)
 	      tree arr = omp_arrays[i];
 	      tree clause;
 
-	      if (OpenMP_Map_Listed_P (ada_omp_pending.target_clauses, arr))
+	      if (OpenMP_Map_Listed_P (omp.target_clauses, arr))
 		continue;
 
 	      clause = Alias_OpenMP_Target_Array (arr, &body);
 
 	      if (clause != NULL_TREE)
-		Add_OpenMP_Clause (&ada_omp_pending.target_clauses, clause);
+		Add_OpenMP_Clause (&omp.target_clauses, clause);
 	    }
 
 	  /* A reduction variable of the inner parallel loop lives in the
 	     target region; map it back so the result is visible after the
 	     region.  */
-	  for (tree rc = ada_omp_pending.loop_clauses; rc;
+	  for (tree rc = omp.loop_clauses; rc;
 	       rc = OMP_CLAUSE_CHAIN (rc))
 	    if (OMP_CLAUSE_CODE (rc) == OMP_CLAUSE_REDUCTION)
 	      {
@@ -4321,13 +4326,13 @@ Loop_Statement_to_gnu (Node_Id gnat_node)
 		tree size = DECL_P (rdecl) ? DECL_SIZE_UNIT (rdecl) : NULL_TREE;
 		tree clause;
 
-		if (OpenMP_Map_Listed_P (ada_omp_pending.target_clauses,
+		if (OpenMP_Map_Listed_P (omp.target_clauses,
 					 rdecl))
 		  continue;
 		clause = Build_OpenMP_Map_Clause_1 (rdecl, size,
 						    GOMP_MAP_TOFROM);
 		if (clause != NULL_TREE)
-		  Add_OpenMP_Clause (&ada_omp_pending.target_clauses, clause);
+		  Add_OpenMP_Clause (&omp.target_clauses, clause);
 	      }
 
 	  tree target = make_node (OMP_TARGET);
@@ -4337,7 +4342,7 @@ Loop_Statement_to_gnu (Node_Id gnat_node)
 				     top, NULL_TREE);
 	  TREE_SIDE_EFFECTS (target_body) = 1;
 	  OMP_TARGET_BODY (target) = target_body;
-	  OMP_TARGET_CLAUSES (target) = ada_omp_pending.target_clauses;
+	  OMP_TARGET_CLAUSES (target) = omp.target_clauses;
 	  gnu_loop_stmt = target;
 	}
       else
