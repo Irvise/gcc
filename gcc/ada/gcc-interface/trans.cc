@@ -1656,81 +1656,6 @@ collect_omp_mappable_arrays (tree *tp, int *walk_subtrees, void *data)
   return NULL_TREE;
 }
 
-/* Substitution data for turning an array declaration into an alias.  */
-
-struct omp_array_subst {
-  tree from;
-  tree to;
-};
-
-/* Replace FROM with TO in the OpenMP region body being walked.  */
-
-static tree
-substitute_omp_array (tree *tp, int *walk_subtrees, void *data)
-{
-  omp_array_subst *subst = (omp_array_subst *) data;
-
-  if (*tp == subst->from)
-    {
-      *tp = subst->to;
-      *walk_subtrees = 0;
-    }
-  return NULL_TREE;
-}
-
-/* Return the pointer expression that addresses the data of the local array
-   DECL, creating the pointer temporary PTR if needed.  Ada keeps the data
-   pointer in an ordinary variable once the array has been gimplified, but
-   the front end sees an ordinary array object.  */
-
-static tree
-OpenMP_Array_Data_Pointer (tree decl, tree *ptr)
-{
-  if (DECL_HAS_VALUE_EXPR_P (decl)
-      && INDIRECT_REF_P (DECL_VALUE_EXPR (decl)))
-    {
-      *ptr = create_temporary
-	("P", TREE_TYPE (TREE_OPERAND (DECL_VALUE_EXPR (decl), 0)));
-      return TREE_OPERAND (DECL_VALUE_EXPR (decl), 0);
-    }
-
-  *ptr = create_temporary ("P", build_pointer_type (TREE_TYPE (decl)));
-  return build_fold_addr_expr (decl);
-}
-
-/* Rewrite accesses to the local array ARR in the target region body BODY so
-   that they go through a fresh plain pointer variable, and return the MAP
-   clause for that pointer.  Ada keeps the data pointer of an array in an
-   ordinary variable, but when the array must be reachable from a nested
-   subprogram that variable is turned into a frame-record member by the
-   middle end, a representation that the OpenMP lowering cannot map.  Using
-   an explicit pointer gives it the same shape as a C array section.  */
-
-static tree
-Alias_OpenMP_Target_Array (tree arr, tree *body)
-{
-  tree ptr, ptr_expr;
-  omp_array_subst subst;
-
-  ptr_expr = OpenMP_Array_Data_Pointer (arr, &ptr);
-
-  /* Replace accesses to the array object with accesses through the pointer.
-     The pointed-to array is an lvalue, so this is valid in every context
-     where the array object itself was used.  */
-  subst.from = arr;
-  subst.to = build1 (INDIRECT_REF, TREE_TYPE (arr), ptr);
-  walk_tree (body, substitute_omp_array, &subst, NULL);
-
-  /* Initialise the pointer before entering the region.  */
-  add_stmt (build_binary_op (MODIFY_EXPR, NULL_TREE, ptr, ptr_expr));
-
-  /* Map the pointed-to object (the same shape as the C map(p[0:n])
-     clause), not the pointer variable: the runtime must receive the data
-     address, not the address of the temporary holding it.  */
-  return Build_OpenMP_Map_Clause_1 (subst.to, DECL_SIZE_UNIT (arr),
-				    GOMP_MAP_TOFROM);
-}
-
 /* Add map clauses for an Ada aggregate of array/scalar names.  The initial
    implementation maps every listed object to/from the device.  */
 
@@ -4309,7 +4234,7 @@ Loop_Statement_to_gnu (Node_Id gnat_node)
 	      if (OpenMP_Map_Listed_P (omp.target_clauses, arr))
 		continue;
 
-	      clause = Alias_OpenMP_Target_Array (arr, &body);
+	      clause = Build_OpenMP_Map_Clause (arr, GOMP_MAP_TOFROM);
 
 	      if (clause != NULL_TREE)
 		Add_OpenMP_Clause (&omp.target_clauses, clause);
