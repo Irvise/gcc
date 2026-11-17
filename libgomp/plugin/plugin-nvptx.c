@@ -3212,7 +3212,11 @@ GOMP_OFFLOAD_run (struct gomp_offload_session *session, void *tgt_fn, void **arg
 	usleep (1);
       }
   else
-    r = CUDA_CALL_NOCHECK (cuCtxSynchronize, );
+    /* The kernel is launched on the NULL (legacy default) stream.  Wait for
+       that stream, not the whole context: cuCtxSynchronize serializes and
+       flushes every stream in the context and was costing several hundred
+       microseconds per target region on this driver.  */
+    r = CUDA_CALL_NOCHECK (cuStreamSynchronize, NULL);
   if (r == CUDA_ERROR_LAUNCH_FAILED)
     GOMP_PLUGIN_fatal ("cuCtxSynchronize error: %s %s\n", cuda_error (r),
 		       maybe_abort_msg);

@@ -237,6 +237,7 @@ enum ada_omp_directive {
   ADA_OMP_PARALLEL_FOR_SIMD,
   ADA_OMP_PARALLEL_BLOCK,
   ADA_OMP_CRITICAL,
+  ADA_OMP_TARGET_DATA,
   ADA_OMP_BARRIER
 };
 
@@ -2204,6 +2205,8 @@ Record_OpenMP_Pragma (Node_Id gnat_node)
 	    ada_omp_pending.directive = ADA_OMP_PARALLEL_BLOCK;
 	  else if (OMP_Name_Is (directive, "Critical"))
 	    ada_omp_pending.directive = ADA_OMP_CRITICAL;
+	  else if (OMP_Name_Is (directive, "Target_Data"))
+	    ada_omp_pending.directive = ADA_OMP_TARGET_DATA;
 	  else if (OMP_Name_Is (directive, "Barrier"))
 	    ada_omp_pending.directive = ADA_OMP_BARRIER;
 	  else
@@ -9131,15 +9134,23 @@ gnat_to_gnu (Node_Id gnat_node)
 
     case N_Block_Statement:
       {
-	/* A pending pragma OpenMP (Parallel) or (Critical) applies to this
-	   block.  Consume it first so loops inside the block do not treat it
-	   as their own directive.  */
+	/* A pending pragma OpenMP (Parallel), (Critical) or (Target_Data)
+	   applies to this block.  Consume it first so loops inside the block
+	   do not treat it as their own directive.  */
 	bool block_omp
 	  = ada_omp_pending.active
 	    && (ada_omp_pending.directive == ADA_OMP_PARALLEL_BLOCK
-		|| ada_omp_pending.directive == ADA_OMP_CRITICAL);
+		|| ada_omp_pending.directive == ADA_OMP_CRITICAL
+		|| ada_omp_pending.directive == ADA_OMP_TARGET_DATA
+		|| (ada_omp_pending.directive == ADA_OMP_PARALLEL_FOR
+		    && ada_omp_pending.target));
 	enum ada_omp_directive block_dir = ada_omp_pending.directive;
-	tree block_clauses = ada_omp_pending.par_clauses;
+	bool block_target = (block_dir == ADA_OMP_PARALLEL_FOR
+			     && ada_omp_pending.target);
+	tree block_clauses
+	  = ((block_dir == ADA_OMP_TARGET_DATA || block_target)
+	     ? ada_omp_pending.target_clauses
+	     : ada_omp_pending.par_clauses);
 
 	if (block_omp)
 	  ada_omp_pending = ada_omp_pending_d ();
@@ -9182,6 +9193,33 @@ gnat_to_gnu (Node_Id gnat_node)
 		OMP_PARALLEL_CLAUSES (par) = block_clauses;
 		TREE_SIDE_EFFECTS (par) = 1;
 		gnu_result = par;
+	      }
+	    else if (block_target)
+	      {
+		/* A bare Target pragma before a block: run the whole block on
+		   the device, with plain Parallel_For loops inside it.  This
+		   is the shape multi-step kernels need: one launch per
+		   repetition instead of one per time step.  */
+		tree tgt = make_node (OMP_TARGET);
+		TREE_TYPE (tgt) = void_type_node;
+		SET_EXPR_LOCATION (tgt, input_location);
+		OMP_TARGET_BODY (tgt) = body;
+		OMP_TARGET_CLAUSES (tgt) = block_clauses;
+		TREE_SIDE_EFFECTS (tgt) = 1;
+		gnu_result = tgt;
+	      }
+	    else if (block_dir == ADA_OMP_TARGET_DATA)
+	      {
+		/* Keep the listed arrays resident on the device for the whole
+		   block.  Inner Target regions then find the data already
+		   present and do not copy it again.  */
+		tree td = make_node (OMP_TARGET_DATA);
+		TREE_TYPE (td) = void_type_node;
+		SET_EXPR_LOCATION (td, input_location);
+		OMP_TARGET_DATA_BODY (td) = body;
+		OMP_TARGET_DATA_CLAUSES (td) = block_clauses;
+		TREE_SIDE_EFFECTS (td) = 1;
+		gnu_result = td;
 	      }
 	    else
 	      {
