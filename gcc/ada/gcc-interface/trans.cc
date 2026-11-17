@@ -3709,6 +3709,11 @@ Loop_Statement_to_gnu (Node_Id gnat_node)
       enum tree_code update_code, test_code, shift_code;
       bool reverse = Reverse_Present (gnat_loop_spec), use_iv = false;
       omp_loop = ada_omp_pending.active;
+      /* Consume the directive now: the loop body may contain nested loops
+	 that must not be turned into OpenMP loops themselves.  The remaining
+	 fields are still needed below to build the construct.  */
+      if (omp_loop)
+	ada_omp_pending.active = false;
       if (omp_loop)
 	ada_omp_pending.reverse = reverse;
 
@@ -3965,13 +3970,19 @@ Loop_Statement_to_gnu (Node_Id gnat_node)
       clauses = c;
 
       /* Privatize artificial temporaries created in the body (Ada indexing
-	 conversions often introduce function-scope sizetype temporaries).  */
+	 conversions often introduce function-scope sizetype temporaries).
+	 Variables that merely materialize a type bound or size are constants
+	 for the region and must stay shared: privatizing them conflicts with
+	 the middle end's own firstprivate treatment of type sizes.  */
       tree body = LOOP_STMT_BODY (gnu_loop_stmt);
       auto_vec<tree> omp_temps;
       omp_temp_data temp_data = { var, &omp_temps };
       walk_tree (&body, collect_omp_temporaries, &temp_data, NULL);
       for (unsigned i = 0; i < omp_temps.length (); i++)
 	{
+	  if (DECL_INITIAL (omp_temps[i]) != NULL_TREE
+	      && TREE_READONLY (omp_temps[i]))
+	    continue;
 	  c = build_omp_clause (input_location, OMP_CLAUSE_PRIVATE);
 	  OMP_CLAUSE_DECL (c) = omp_temps[i];
 	  OMP_CLAUSE_CHAIN (c) = clauses;
