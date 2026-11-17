@@ -502,6 +502,7 @@ extern bool global_bindings_p (void);
 
 /* Enter and exit a new binding level.  */
 extern void gnat_pushlevel (void);
+extern void gnat_omp_retain_current_block (void);
 extern void gnat_poplevel (void);
 extern void gnat_zaplevel (void);
 

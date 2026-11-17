@@ -13053,6 +13053,8 @@ package body Sem_Prag is
                                    or else EName = "for_simd"
                                    or else EName = "simd"
                                    or else EName = "parallel"
+                                   or else EName = "critical"
+                                   or else EName = "barrier"
                                    or else EName = "for"
                                    or else EName = "nowait"
                                    or else EName = "ordered"

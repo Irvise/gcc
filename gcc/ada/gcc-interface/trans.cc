@@ -234,7 +234,10 @@ enum ada_omp_directive {
   ADA_OMP_PARALLEL_FOR,
   ADA_OMP_FOR,
   ADA_OMP_SIMD,
-  ADA_OMP_PARALLEL_FOR_SIMD
+  ADA_OMP_PARALLEL_FOR_SIMD,
+  ADA_OMP_PARALLEL_BLOCK,
+  ADA_OMP_CRITICAL,
+  ADA_OMP_BARRIER
 };
 
 struct ada_omp_pending_d {
@@ -1899,9 +1902,14 @@ Record_OpenMP_Pragma (Node_Id gnat_node)
 	    ada_omp_pending.directive = ADA_OMP_PARALLEL_FOR_SIMD;
 	  else if (OMP_Name_Is (directive, "For"))
 	    ada_omp_pending.directive = ADA_OMP_FOR;
-	  else if (OMP_Name_Is (directive, "Parallel_For")
-		   || OMP_Name_Is (directive, "Parallel"))
+	  else if (OMP_Name_Is (directive, "Parallel_For"))
 	    ada_omp_pending.directive = ADA_OMP_PARALLEL_FOR;
+	  else if (OMP_Name_Is (directive, "Parallel"))
+	    ada_omp_pending.directive = ADA_OMP_PARALLEL_BLOCK;
+	  else if (OMP_Name_Is (directive, "Critical"))
+	    ada_omp_pending.directive = ADA_OMP_CRITICAL;
+	  else if (OMP_Name_Is (directive, "Barrier"))
+	    ada_omp_pending.directive = ADA_OMP_BARRIER;
 	  else
 	    {
 	      int code = Find_OpenMP_Clause_Code (directive);
@@ -1958,6 +1966,17 @@ Pragma_to_gnu (Node_Id gnat_node)
 	  return gnu_result;
 	}
       Record_OpenMP_Pragma (gnat_node);
+      if (ada_omp_pending.directive == ADA_OMP_BARRIER)
+	{
+	  /* GCC has no OMP_BARRIER tree node; barriers are lowered to the
+	     libgomp entry point.  Emit it directly.  */
+	  tree barrier
+	    = build_call_expr (builtin_decl_explicit (BUILT_IN_GOMP_BARRIER), 0);
+	  SET_EXPR_LOCATION (barrier, input_location);
+	  TREE_SIDE_EFFECTS (barrier) = 1;
+	  ada_omp_pending = ada_omp_pending_d ();
+	  return barrier;
+	}
       return gnu_result;
     }
 
@@ -8651,20 +8670,71 @@ gnat_to_gnu (Node_Id gnat_node)
       break;
 
     case N_Block_Statement:
-      /* The only way to enter the block is to fall through to it.  */
-      if (stmt_group_may_fallthru ())
-	{
-	  start_stmt_group ();
-	  gnat_pushlevel ();
-	  process_decls (Declarations (gnat_node), Empty, true, true);
-	  add_stmt (gnat_to_gnu (Handled_Statement_Sequence (gnat_node)));
-	  if (Present (At_End_Proc (gnat_node)))
-	    At_End_Proc_to_gnu (gnat_node);
-	  gnat_poplevel ();
-	  gnu_result = end_stmt_group ();
-	}
-      else
-	gnu_result = alloc_stmt_list ();
+      {
+	/* A pending pragma OpenMP (Parallel) or (Critical) applies to this
+	   block.  Consume it first so loops inside the block do not treat it
+	   as their own directive.  */
+	bool block_omp
+	  = ada_omp_pending.active
+	    && (ada_omp_pending.directive == ADA_OMP_PARALLEL_BLOCK
+		|| ada_omp_pending.directive == ADA_OMP_CRITICAL);
+	enum ada_omp_directive block_dir = ada_omp_pending.directive;
+	tree block_clauses = ada_omp_pending.par_clauses;
+
+	if (block_omp)
+	  ada_omp_pending = ada_omp_pending_d ();
+
+	/* The only way to enter the block is to fall through to it.  */
+	if (stmt_group_may_fallthru ())
+	  {
+	    start_stmt_group ();
+	    gnat_pushlevel ();
+	    process_decls (Declarations (gnat_node), Empty, true, true);
+	    add_stmt (gnat_to_gnu (Handled_Statement_Sequence (gnat_node)));
+	    if (Present (At_End_Proc (gnat_node)))
+	      At_End_Proc_to_gnu (gnat_node);
+	    if (block_omp)
+	      gnat_omp_retain_current_block ();
+	    gnat_poplevel ();
+	    gnu_result = end_stmt_group ();
+	  }
+	else
+	  gnu_result = alloc_stmt_list ();
+
+	if (block_omp)
+	  {
+	    /* end_stmt_group wraps the statements in a BIND_EXPR with the
+	       block's variables when the level was retained.  */
+	    tree body
+	      = (TREE_CODE (gnu_result) == BIND_EXPR
+		 ? gnu_result
+		 : build3 (BIND_EXPR, void_type_node, NULL_TREE,
+			   gnu_result, NULL_TREE));
+	    TREE_SIDE_EFFECTS (body) = 1;
+	    TREE_SIDE_EFFECTS (body) = 1;
+
+	    if (block_dir == ADA_OMP_PARALLEL_BLOCK)
+	      {
+		tree par = make_node (OMP_PARALLEL);
+		TREE_TYPE (par) = void_type_node;
+		SET_EXPR_LOCATION (par, input_location);
+		OMP_PARALLEL_BODY (par) = body;
+		OMP_PARALLEL_CLAUSES (par) = block_clauses;
+		TREE_SIDE_EFFECTS (par) = 1;
+		gnu_result = par;
+	      }
+	    else
+	      {
+		tree crit = make_node (OMP_CRITICAL);
+		TREE_TYPE (crit) = void_type_node;
+		SET_EXPR_LOCATION (crit, input_location);
+		OMP_CRITICAL_BODY (crit) = body;
+		OMP_CRITICAL_NAME (crit) = NULL_TREE;
+		TREE_SIDE_EFFECTS (crit) = 1;
+		gnu_result = crit;
+	      }
+	  }
+      }
       break;
 
     case N_Exit_Statement:

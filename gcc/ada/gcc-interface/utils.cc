@@ -737,6 +737,34 @@ gnat_poplevel (void)
   free_binding_level = level;
 }
 
+/* Force the current binding level's BLOCK to be retained when the level is
+   popped.  gnat_poplevel discards blocks without variables and merges their
+   subblocks into the parent; an OpenMP parallel body needs a real BIND_EXPR
+   with its own BLOCK so that the outlined function keeps a consistent block
+   tree.  An artificial variable is enough to keep the block.  */
+
+void
+gnat_omp_retain_current_block (void)
+{
+  tree decl;
+
+  if (!current_binding_level)
+    return;
+
+  decl = build_decl (BUILTINS_LOCATION, VAR_DECL,
+		     get_identifier ("GNAT_OMP_REGION_MARKER"),
+		     integer_type_node);
+  DECL_ARTIFICIAL (decl) = 1;
+  DECL_IGNORED_P (decl) = 1;
+  TREE_USED (decl) = 1;
+  DECL_CONTEXT (decl) = current_function_decl;
+
+  add_decl_expr (decl, Empty);
+
+  DECL_CHAIN (decl) = BLOCK_VARS (current_binding_level->block);
+  BLOCK_VARS (current_binding_level->block) = decl;
+}
+
 /* Exit a binding level and discard the associated BLOCK.  */
 
 void
