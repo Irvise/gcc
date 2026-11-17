@@ -1724,7 +1724,10 @@ Alias_OpenMP_Target_Array (tree arr, tree *body)
   /* Initialise the pointer before entering the region.  */
   add_stmt (build_binary_op (MODIFY_EXPR, NULL_TREE, ptr, ptr_expr));
 
-  return Build_OpenMP_Map_Clause_1 (ptr, DECL_SIZE_UNIT (arr),
+  /* Map the pointed-to object (the same shape as the C map(p[0:n])
+     clause), not the pointer variable: the runtime must receive the data
+     address, not the address of the temporary holding it.  */
+  return Build_OpenMP_Map_Clause_1 (subst.to, DECL_SIZE_UNIT (arr),
 				    GOMP_MAP_TOFROM);
 }
 
@@ -4197,10 +4200,13 @@ Loop_Statement_to_gnu (Node_Id gnat_node)
 	  clauses = c;
 	}
 
-      TREE_VEC_ELT (init, 0) = build2 (MODIFY_EXPR, type, var, low);
+      TREE_VEC_ELT (init, 0)
+	= build2 (MODIFY_EXPR, type, var,
+		  ada_omp_pending.reverse ? high : low);
       TREE_VEC_ELT (cond, 0)
 	= build2 (ada_omp_pending.reverse ? GE_EXPR : LE_EXPR,
-		  boolean_type_node, var, high);
+		  boolean_type_node, var,
+		  ada_omp_pending.reverse ? low : high);
       TREE_VEC_ELT (incr, 0)
 	= build2 (MODIFY_EXPR, type, var,
 		  build2 (ada_omp_pending.reverse ? MINUS_EXPR : PLUS_EXPR,
