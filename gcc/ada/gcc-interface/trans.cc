@@ -302,6 +302,7 @@ static bool set_end_locus_from_node (tree, Node_Id);
 static int lvalue_required_p (Node_Id, tree, bool, bool);
 static tree build_raise_check (int, enum exception_info_kind);
 static tree create_init_temporary (const char *, tree, tree *, Node_Id);
+static tree create_temporary (const char *, tree);
 static bool maybe_make_gnu_thunk (Entity_Id gnat_thunk, tree gnu_thunk);
 
 /* This makes gigi's file_info_ptr visible in this translation unit,
@@ -1526,6 +1527,189 @@ Add_OpenMP_Decl_Clauses (Node_Id expr, int code, tree *list)
     }
 }
 
+/* Build one OpenMP MAP clause for EXPR with the given SIZE, or NULL_TREE if
+   no size can be determined.  */
+
+static tree
+Build_OpenMP_Map_Clause_1 (tree expr, tree size, enum gomp_map_kind kind)
+{
+  tree clause;
+
+  if (size == NULL_TREE || size == error_mark_node)
+    size = TYPE_SIZE_UNIT (TREE_TYPE (expr));
+  if (size == NULL_TREE || size == error_mark_node)
+    return NULL_TREE;
+
+  clause = build_omp_clause (input_location, OMP_CLAUSE_MAP);
+  OMP_CLAUSE_DECL (clause) = expr;
+  OMP_CLAUSE_SET_MAP_KIND (clause, kind);
+  OMP_CLAUSE_SIZE (clause) = size;
+  return clause;
+}
+
+/* Build one OpenMP MAP clause for the object DECL, with mapping kind KIND.
+   Ada unconstrained arrays are implemented either as the array object itself
+   or as a pointer to the data.  In the latter case map the pointed-to object
+   so that the middle end sees the same shape as for a C array section
+   instead of failing on the implicit mapping of a variable-size array.
+   Return NULL_TREE if no size can be determined.  */
+
+static tree
+Build_OpenMP_Map_Clause (tree decl, enum gomp_map_kind kind)
+{
+  tree expr = decl;
+  tree size = NULL_TREE;
+
+  if (DECL_P (decl)
+      && TREE_CODE (TREE_TYPE (decl)) == ARRAY_TYPE
+      && DECL_HAS_VALUE_EXPR_P (decl)
+      && INDIRECT_REF_P (DECL_VALUE_EXPR (decl)))
+    {
+      expr = DECL_VALUE_EXPR (decl);
+      size = DECL_SIZE_UNIT (decl);
+    }
+
+  return Build_OpenMP_Map_Clause_1 (expr, size, kind);
+}
+
+/* Return true if DECL, or the object it designates through a value
+   expression, is already mapped by one of the clauses in LIST.  */
+
+static bool
+OpenMP_Map_Listed_P (tree list, tree decl)
+{
+  tree value = DECL_P (decl) && DECL_HAS_VALUE_EXPR_P (decl)
+    ? DECL_VALUE_EXPR (decl) : NULL_TREE;
+
+  for (tree c = list; c; c = OMP_CLAUSE_CHAIN (c))
+    if (OMP_CLAUSE_CODE (c) == OMP_CLAUSE_MAP)
+      {
+	tree d = OMP_CLAUSE_DECL (c);
+	if (d == decl || (value != NULL_TREE && d == value))
+	  return true;
+      }
+
+  return false;
+}
+
+/* Return true if DECL is a local array that must be mapped explicitly in an
+   OpenMP target region.  Variables declared inside the region are excluded:
+   for those the front end has already left the expected sharing behaviour to
+   the middle end.  */
+
+static bool
+Is_OpenMP_Mappable_Array (tree decl)
+{
+  return (VAR_P (decl)
+	  && TREE_CODE (TREE_TYPE (decl)) == ARRAY_TYPE
+	  && !DECL_ARTIFICIAL (decl)
+	  && !TREE_STATIC (decl)
+	  && !DECL_EXTERNAL (decl)
+	  && DECL_CONTEXT (decl) == current_function_decl);
+}
+
+/* Collect the local arrays referenced by an OpenMP target body.  */
+
+static tree
+collect_omp_mappable_arrays (tree *tp, int *walk_subtrees, void *data)
+{
+  tree t = *tp;
+  auto_vec<tree> *decls = (auto_vec<tree> *) data;
+
+  if (t == NULL_TREE)
+    return NULL_TREE;
+
+  if (VAR_P (t))
+    {
+      if (Is_OpenMP_Mappable_Array (t))
+	{
+	  bool seen = false;
+	  for (unsigned i = 0; i < decls->length (); i++)
+	    if ((*decls)[i] == t)
+	      {
+		seen = true;
+		break;
+	      }
+	  if (!seen)
+	    decls->safe_push (t);
+	}
+      *walk_subtrees = 0;
+    }
+  return NULL_TREE;
+}
+
+/* Substitution data for turning an array declaration into an alias.  */
+
+struct omp_array_subst {
+  tree from;
+  tree to;
+};
+
+/* Replace FROM with TO in the OpenMP region body being walked.  */
+
+static tree
+substitute_omp_array (tree *tp, int *walk_subtrees, void *data)
+{
+  omp_array_subst *subst = (omp_array_subst *) data;
+
+  if (*tp == subst->from)
+    {
+      *tp = subst->to;
+      *walk_subtrees = 0;
+    }
+  return NULL_TREE;
+}
+
+/* Return the pointer expression that addresses the data of the local array
+   DECL, creating the pointer temporary PTR if needed.  Ada keeps the data
+   pointer in an ordinary variable once the array has been gimplified, but
+   the front end sees an ordinary array object.  */
+
+static tree
+OpenMP_Array_Data_Pointer (tree decl, tree *ptr)
+{
+  if (DECL_HAS_VALUE_EXPR_P (decl)
+      && INDIRECT_REF_P (DECL_VALUE_EXPR (decl)))
+    {
+      *ptr = create_temporary
+	("P", TREE_TYPE (TREE_OPERAND (DECL_VALUE_EXPR (decl), 0)));
+      return TREE_OPERAND (DECL_VALUE_EXPR (decl), 0);
+    }
+
+  *ptr = create_temporary ("P", build_pointer_type (TREE_TYPE (decl)));
+  return build_fold_addr_expr (decl);
+}
+
+/* Rewrite accesses to the local array ARR in the target region body BODY so
+   that they go through a fresh plain pointer variable, and return the MAP
+   clause for that pointer.  Ada keeps the data pointer of an array in an
+   ordinary variable, but when the array must be reachable from a nested
+   subprogram that variable is turned into a frame-record member by the
+   middle end, a representation that the OpenMP lowering cannot map.  Using
+   an explicit pointer gives it the same shape as a C array section.  */
+
+static tree
+Alias_OpenMP_Target_Array (tree arr, tree *body)
+{
+  tree ptr, ptr_expr;
+  omp_array_subst subst;
+
+  ptr_expr = OpenMP_Array_Data_Pointer (arr, &ptr);
+
+  /* Replace accesses to the array object with accesses through the pointer.
+     The pointed-to array is an lvalue, so this is valid in every context
+     where the array object itself was used.  */
+  subst.from = arr;
+  subst.to = build1 (INDIRECT_REF, TREE_TYPE (arr), ptr);
+  walk_tree (body, substitute_omp_array, &subst, NULL);
+
+  /* Initialise the pointer before entering the region.  */
+  add_stmt (build_binary_op (MODIFY_EXPR, NULL_TREE, ptr, ptr_expr));
+
+  return Build_OpenMP_Map_Clause_1 (ptr, DECL_SIZE_UNIT (arr),
+				    GOMP_MAP_TOFROM);
+}
+
 /* Add map clauses for an Ada aggregate of array/scalar names.  The initial
    implementation maps every listed object to/from the device.  */
 
@@ -1534,18 +1718,13 @@ Add_OpenMP_Map_Clauses (Node_Id expr, tree *list, enum gomp_map_kind kind)
 {
   auto add_one = [&] (Node_Id elem) {
     tree decl = gnat_to_gnu (elem);
-    tree type = TREE_TYPE (decl);
-    tree size = TYPE_SIZE_UNIT (type);
-    tree clause = build_omp_clause (input_location, OMP_CLAUSE_MAP);
+    tree clause = Build_OpenMP_Map_Clause (decl, kind);
 
-    if (size == NULL_TREE || size == error_mark_node)
+    if (clause == NULL_TREE)
       {
 	post_error ("OpenMP Map object has unknown size??", elem);
 	return;
       }
-    OMP_CLAUSE_DECL (clause) = decl;
-    OMP_CLAUSE_SET_MAP_KIND (clause, kind);
-    OMP_CLAUSE_SIZE (clause) = size;
     Add_OpenMP_Clause (list, clause);
   };
 
@@ -4042,10 +4221,28 @@ Loop_Statement_to_gnu (Node_Id gnat_node)
 	  top = teams;
 	}
 
-      /* Wrap in a target region if requested.  Map clauses are implicit for
-	 now; GCC's target lowering maps referenced variables.  */
+      /* Wrap in a target region if requested.  Local arrays need explicit
+	 map clauses: unlike C and Fortran, an Ada array can be represented as
+	 a pointer inside a frame record, which the implicit mapping in the
+	 middle end cannot handle.  */
       if (ada_omp_pending.target)
 	{
+	  auto_vec<tree> omp_arrays;
+	  walk_tree (&body, collect_omp_mappable_arrays, &omp_arrays, NULL);
+	  for (unsigned i = 0; i < omp_arrays.length (); i++)
+	    {
+	      tree arr = omp_arrays[i];
+	      tree clause;
+
+	      if (OpenMP_Map_Listed_P (ada_omp_pending.target_clauses, arr))
+		continue;
+
+	      clause = Alias_OpenMP_Target_Array (arr, &body);
+
+	      if (clause != NULL_TREE)
+		Add_OpenMP_Clause (&ada_omp_pending.target_clauses, clause);
+	    }
+
 	  tree target = make_node (OMP_TARGET);
 	  TREE_TYPE (target) = void_type_node;
 	  SET_EXPR_LOCATION (target, input_location);
