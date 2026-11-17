@@ -4317,14 +4317,21 @@ gnat_to_gnu_entity (Entity_Id gnat_entity, tree gnu_expr, bool definition)
 	    else if (extern_flag && gnu_ext_name == DECL_NAME (realloc_decl))
 	      gnu_decl = realloc_decl;
 	    else
-	      gnu_decl
-		= create_subprog_decl (gnu_entity_name, gnu_ext_name,
-				       gnu_type, gnu_param_list, inline_status,
-				       Is_Public (gnat_entity) || imported_p,
-				       Is_Link_Once (gnat_entity),
-				       extern_flag, artificial_p, debug_info_p,
-				       definition && imported_p, attr_list,
-				       gnat_entity);
+	      {
+		if (current_function_decl != NULL_TREE
+		    && !imported_p && !extern_flag && !Is_Public (gnat_entity)
+		    && Comes_From_Source (gnat_entity)
+		    && (kind == E_Function || kind == E_Procedure))
+		  gnat_omp_note_nested_subprogram ();
+		gnu_decl
+		  = create_subprog_decl (gnu_entity_name, gnu_ext_name,
+					 gnu_type, gnu_param_list, inline_status,
+					 Is_Public (gnat_entity) || imported_p,
+					 Is_Link_Once (gnat_entity),
+					 extern_flag, artificial_p, debug_info_p,
+					 definition && imported_p, attr_list,
+					 gnat_entity);
+	      }
 	  }
       }
       break;

@@ -3706,6 +3706,9 @@ create_label_decl (tree name, Node_Id gnat_node)
 
    GNAT_NODE is used for the position of the decl.  */
 
+/* Set while translating a scope that contains a nested subprogram.  */
+static bool gnat_omp_nested_subprogram = false;
+
 tree
 create_subprog_decl (tree name, tree asm_name, tree type, tree param_decl_list,
 		     enum inline_status_t inline_status, bool public_flag,
@@ -3714,6 +3717,11 @@ create_subprog_decl (tree name, tree asm_name, tree type, tree param_decl_list,
 		     struct attrib *attr_list, Node_Id gnat_node)
 {
   tree subprog_decl = build_decl (input_location, FUNCTION_DECL, name, type);
+
+  /* A nested subprogram makes the enclosing scope use a frame record for
+     locals it references; OpenMP target lowering is conservative there.  */
+  if (definition && current_function_decl != NULL_TREE)
+    gnat_omp_nested_subprogram = true;
   DECL_ARGUMENTS (subprog_decl) = param_decl_list;
 
   DECL_ARTIFICIAL (subprog_decl) = artificial_p;
@@ -3836,9 +3844,25 @@ finish_subprog_decl (tree decl, tree asm_name, tree type)
    body.  This routine needs to be invoked before processing the declarations
    appearing in the subprogram.  */
 
+static vec<bool> gnat_omp_nested_stack;
+
+void
+gnat_omp_note_nested_subprogram (void)
+{
+  gnat_omp_nested_subprogram = true;
+}
+
+bool
+gnat_omp_current_function_has_nested_subprogram (void)
+{
+  return gnat_omp_nested_subprogram;
+}
+
 void
 begin_subprog_body (tree subprog_decl)
 {
+  gnat_omp_nested_stack.safe_push (gnat_omp_nested_subprogram);
+  gnat_omp_nested_subprogram = false;
   announce_function (subprog_decl);
 
   /* This function is being defined.  */
@@ -3878,6 +3902,10 @@ end_subprog_body (tree body)
   DECL_SAVED_TREE (fndecl) = body;
 
   current_function_decl = decl_function_context (fndecl);
+
+  bool child_has_nested = gnat_omp_nested_subprogram;
+  gnat_omp_nested_subprogram = gnat_omp_nested_stack.pop ();
+  gnat_omp_nested_subprogram |= child_has_nested;
 }
 
 /* Wrap up compilation of SUBPROG_DECL, a subprogram body.  */

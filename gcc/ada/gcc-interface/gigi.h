@@ -770,6 +770,8 @@ extern void process_attributes (tree *node, struct attrib **attr_list,
 /* Set up the framework for generating code for SUBPROG_DECL, a subprogram
    body. This routine needs to be invoked before processing the declarations
    appearing in the subprogram.  */
+extern bool gnat_omp_current_function_has_nested_subprogram (void);
+extern void gnat_omp_note_nested_subprogram (void);
 extern void begin_subprog_body (tree subprog_decl);
 
 /* Finish translating the current subprogram and set its BODY.  */

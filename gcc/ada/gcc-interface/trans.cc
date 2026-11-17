@@ -1656,6 +1656,62 @@ collect_omp_mappable_arrays (tree *tp, int *walk_subtrees, void *data)
   return NULL_TREE;
 }
 
+/* Substitution data for rewriting an array through a pointer alias.  */
+
+struct omp_array_subst {
+  tree from;
+  tree to;
+};
+
+static tree
+substitute_omp_array (tree *tp, int *walk_subtrees, void *data)
+{
+  omp_array_subst *subst = (omp_array_subst *) data;
+
+  if (*tp == subst->from)
+    {
+      *tp = subst->to;
+      *walk_subtrees = 0;
+    }
+  return NULL_TREE;
+}
+
+/* Fallback for scopes that contain nested subprograms: the middle end may
+   keep the array data pointer in a frame record, which the implicit target
+   mapping cannot handle.  Access the array through a fresh pointer and map
+   the pointee, as in the C map(p[0:n]) form.  */
+
+static tree
+Alias_OpenMP_Target_Array (tree arr, tree *body)
+{
+  tree arr_type = TREE_TYPE (arr);
+  tree ptr_type;
+  tree ptr_expr;
+
+  if (DECL_HAS_VALUE_EXPR_P (arr)
+      && INDIRECT_REF_P (DECL_VALUE_EXPR (arr)))
+    {
+      ptr_expr = TREE_OPERAND (DECL_VALUE_EXPR (arr), 0);
+      ptr_type = TREE_TYPE (ptr_expr);
+    }
+  else
+    {
+      ptr_type = build_pointer_type (arr_type);
+      ptr_expr = build_fold_addr_expr (arr);
+    }
+
+  tree ptr = create_temporary ("P", ptr_type);
+  omp_array_subst subst;
+
+  subst.from = arr;
+  subst.to = build1 (INDIRECT_REF, arr_type, ptr);
+  walk_tree (body, substitute_omp_array, &subst, NULL);
+  add_stmt (build_binary_op (MODIFY_EXPR, NULL_TREE, ptr, ptr_expr));
+
+  return Build_OpenMP_Map_Clause_1 (subst.to, DECL_SIZE_UNIT (arr),
+				    GOMP_MAP_TOFROM);
+}
+
 /* Add map clauses for an Ada aggregate of array/scalar names.  The initial
    implementation maps every listed object to/from the device.  */
 
@@ -4202,8 +4258,38 @@ Loop_Statement_to_gnu (Node_Id gnat_node)
 	  top = par;
 	}
 
+      /* GPU-style mapping: teams distribute the iteration space across
+	 teams, and the inner parallel loop splits each team's chunk across
+	 threads.  This is the shape the C front end produces for
+	 "target teams distribute parallel for"; without it every team would
+	 execute the whole loop.  */
+      bool gpu_teams = (parallel_region && (omp.teams || omp.target)
+			&& !gnat_omp_current_function_has_nested_subprogram ());
+      if (gpu_teams)
+	{
+	  /* Mark the inner parallel as the worksharing part of a combined
+	     construct; the gimplifier uses this to add the loop-temp bounds
+	     and the runtime to split by teams.  */
+	  OMP_PARALLEL_COMBINED (par) = 1;
+	  /* Combined "teams distribute parallel for": the outer distribute
+	     node has no iteration specification of its own.  The gimplifier
+	     finds the inner parallel/for, creates the team iterator and the
+	     loop-temp bounds, and marks the loop combined; otherwise every
+	     team would execute the whole loop.  */
+	  tree dist = make_node (OMP_DISTRIBUTE);
+	  TREE_TYPE (dist) = void_type_node;
+	  SET_EXPR_LOCATION (dist, input_location);
+	  OMP_FOR_BODY (dist) = par;
+	  OMP_FOR_CLAUSES (dist) = NULL_TREE;
+	  OMP_FOR_INIT (dist) = NULL_TREE;
+	  OMP_FOR_COND (dist) = NULL_TREE;
+	  OMP_FOR_INCR (dist) = NULL_TREE;
+	  TREE_SIDE_EFFECTS (dist) = 1;
+	  top = dist;
+	}
+
       /* gpGPU mapping: teams region around the parallel loop.  */
-      if (omp.teams)
+      if (omp.teams || gpu_teams)
 	{
 	  tree teams = make_node (OMP_TEAMS);
 	  tree teams_body;
@@ -4214,6 +4300,8 @@ Loop_Statement_to_gnu (Node_Id gnat_node)
 	  TREE_SIDE_EFFECTS (teams_body) = 1;
 	  OMP_TEAMS_BODY (teams) = teams_body;
 	  OMP_TEAMS_CLAUSES (teams) = omp.teams_clauses;
+	  if (gpu_teams)
+	    OMP_TEAMS_COMBINED (teams) = 1;
 	  TREE_SIDE_EFFECTS (teams) = 1;
 	  top = teams;
 	}
@@ -4234,7 +4322,9 @@ Loop_Statement_to_gnu (Node_Id gnat_node)
 	      if (OpenMP_Map_Listed_P (omp.target_clauses, arr))
 		continue;
 
-	      clause = Build_OpenMP_Map_Clause (arr, GOMP_MAP_TOFROM);
+	      clause = (gnat_omp_current_function_has_nested_subprogram ()
+			? Alias_OpenMP_Target_Array (arr, &body)
+			: Build_OpenMP_Map_Clause (arr, GOMP_MAP_TOFROM));
 
 	      if (clause != NULL_TREE)
 		Add_OpenMP_Clause (&omp.target_clauses, clause);
