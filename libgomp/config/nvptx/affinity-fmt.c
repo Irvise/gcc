@@ -26,9 +26,9 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
-#ifdef HAVE_UNISTD_H
+/* The nvptx newlib provides unistd.h and write(2); the configure test may
+   not detect it in an accelerator build.  */
 #include <unistd.h>
-#endif
 #ifdef HAVE_INTTYPES_H
 # include <inttypes.h>  /* For PRIx64.  */
 #endif
