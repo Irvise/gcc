@@ -230,10 +230,18 @@ struct GTY(()) loop_info_d {
 typedef struct loop_info_d *loop_info;
 
 /* Pending OpenMP directive attached to the next loop.  */
+enum ada_omp_directive {
+  ADA_OMP_PARALLEL_FOR,
+  ADA_OMP_FOR,
+  ADA_OMP_SIMD,
+  ADA_OMP_PARALLEL_FOR_SIMD
+};
+
 struct ada_omp_pending_d {
   bool active;
   bool target;
   bool reverse;
+  enum ada_omp_directive directive;
   tree par_clauses;
   tree loop_clauses;
   tree chunk_size;
@@ -1611,6 +1619,7 @@ Record_OpenMP_Pragma (Node_Id gnat_node)
 {
   ada_omp_pending = ada_omp_pending_d ();
   ada_omp_pending.active = true;
+  ada_omp_pending.directive = ADA_OMP_PARALLEL_FOR;
   ada_omp_pending.reduction_code = PLUS_EXPR;
 
   for (Node_Id arg = First (Pragma_Argument_Associations (gnat_node));
@@ -1818,10 +1827,16 @@ Record_OpenMP_Pragma (Node_Id gnat_node)
 
 	  if (OMP_Name_Is (directive, "Target"))
 	    ada_omp_pending.target = true;
+	  else if (OMP_Name_Is (directive, "Simd"))
+	    ada_omp_pending.directive = ADA_OMP_SIMD;
+	  else if (OMP_Name_Is (directive, "For_Simd")
+		   || OMP_Name_Is (directive, "Parallel_For_Simd"))
+	    ada_omp_pending.directive = ADA_OMP_PARALLEL_FOR_SIMD;
+	  else if (OMP_Name_Is (directive, "For"))
+	    ada_omp_pending.directive = ADA_OMP_FOR;
 	  else if (OMP_Name_Is (directive, "Parallel_For")
-		   || OMP_Name_Is (directive, "Parallel")
-		   || OMP_Name_Is (directive, "For"))
-	    ;
+		   || OMP_Name_Is (directive, "Parallel"))
+	    ada_omp_pending.directive = ADA_OMP_PARALLEL_FOR;
 	  else
 	    {
 	      int code = Find_OpenMP_Clause_Code (directive);
@@ -3850,7 +3865,12 @@ Loop_Statement_to_gnu (Node_Id gnat_node)
 		  build2 (ada_omp_pending.reverse ? MINUS_EXPR : PLUS_EXPR,
 			  type, var, one));
 
-      for_stmt = make_node (OMP_FOR);
+      bool simd = ada_omp_pending.directive == ADA_OMP_SIMD
+	|| ada_omp_pending.directive == ADA_OMP_PARALLEL_FOR_SIMD;
+      bool parallel_region = ada_omp_pending.directive == ADA_OMP_PARALLEL_FOR
+	|| ada_omp_pending.directive == ADA_OMP_PARALLEL_FOR_SIMD;
+
+      for_stmt = make_node (simd ? OMP_SIMD : OMP_FOR);
       TREE_TYPE (for_stmt) = void_type_node;
       SET_EXPR_LOCATION (for_stmt, input_location);
       OMP_FOR_BODY (for_stmt) = body;
@@ -3859,14 +3879,19 @@ Loop_Statement_to_gnu (Node_Id gnat_node)
       OMP_FOR_COND (for_stmt) = cond;
       OMP_FOR_INCR (for_stmt) = incr;
 
-      par = make_node (OMP_PARALLEL);
-      TREE_TYPE (par) = void_type_node;
-      SET_EXPR_LOCATION (par, input_location);
-      tree par_body = build3 (BIND_EXPR, void_type_node, NULL_TREE,
-			      for_stmt, NULL_TREE);
-      TREE_SIDE_EFFECTS (par_body) = 1;
-      OMP_PARALLEL_BODY (par) = par_body;
-      OMP_PARALLEL_CLAUSES (par) = ada_omp_pending.par_clauses;
+      tree top = for_stmt;
+      if (parallel_region)
+	{
+	  par = make_node (OMP_PARALLEL);
+	  TREE_TYPE (par) = void_type_node;
+	  SET_EXPR_LOCATION (par, input_location);
+	  tree par_body = build3 (BIND_EXPR, void_type_node, NULL_TREE,
+				  for_stmt, NULL_TREE);
+	  TREE_SIDE_EFFECTS (par_body) = 1;
+	  OMP_PARALLEL_BODY (par) = par_body;
+	  OMP_PARALLEL_CLAUSES (par) = ada_omp_pending.par_clauses;
+	  top = par;
+	}
 
       /* Wrap in a target region if requested.  Map clauses are implicit for
 	 now; GCC's target lowering maps referenced variables.  */
@@ -3876,14 +3901,14 @@ Loop_Statement_to_gnu (Node_Id gnat_node)
 	  TREE_TYPE (target) = void_type_node;
 	  SET_EXPR_LOCATION (target, input_location);
 	  tree target_body = build3 (BIND_EXPR, void_type_node, NULL_TREE,
-				     par, NULL_TREE);
+				     top, NULL_TREE);
 	  TREE_SIDE_EFFECTS (target_body) = 1;
 	  OMP_TARGET_BODY (target) = target_body;
 	  OMP_TARGET_CLAUSES (target) = NULL_TREE;
 	  gnu_loop_stmt = target;
 	}
       else
-	gnu_loop_stmt = par;
+	gnu_loop_stmt = top;
       ada_omp_pending = ada_omp_pending_d ();
     }
 
