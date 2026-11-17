@@ -244,6 +244,7 @@ struct ada_omp_pending_d {
   enum ada_omp_directive directive;
   tree par_clauses;
   tree loop_clauses;
+  tree target_clauses;
   tree chunk_size;
   enum tree_code reduction_code;
 };
@@ -1520,8 +1521,43 @@ Add_OpenMP_Decl_Clauses (Node_Id expr, int code, tree *list)
     }
 }
 
-/* Map the reduction operator name OP to a tree code.  */
+/* Add map clauses for an Ada aggregate of array/scalar names.  The initial
+   implementation maps every listed object to/from the device.  */
 
+static void
+Add_OpenMP_Map_Clauses (Node_Id expr, tree *list)
+{
+  auto add_one = [&] (Node_Id elem) {
+    tree decl = gnat_to_gnu (elem);
+    tree type = TREE_TYPE (decl);
+    tree size = TYPE_SIZE_UNIT (type);
+    tree clause = build_omp_clause (input_location, OMP_CLAUSE_MAP);
+
+    if (size == NULL_TREE || size == error_mark_node)
+      {
+	post_error ("OpenMP Map object has unknown size??", elem);
+	return;
+      }
+    OMP_CLAUSE_DECL (clause) = decl;
+    OMP_CLAUSE_SET_MAP_KIND (clause, GOMP_MAP_TOFROM);
+    OMP_CLAUSE_SIZE (clause) = size;
+    Add_OpenMP_Clause (list, clause);
+  };
+
+  if (Nkind (expr) == N_Aggregate && Present (Expressions (expr)))
+    {
+      Node_Id elem = First (Expressions (expr));
+      while (Present (elem))
+	{
+	  add_one (elem);
+	  elem = Next (elem);
+	}
+    }
+  else
+    add_one (expr);
+}
+
+/* Map the reduction operator name OP to a tree code.  */
 static enum tree_code
 OpenMP_Reduction_Code (const char *op)
 {
@@ -1828,6 +1864,20 @@ Record_OpenMP_Pragma (Node_Id gnat_node)
 	    case OMP_CLAUSE_COPYIN:
 	      Add_OpenMP_Decl_Clauses (expr, code,
 				       &ada_omp_pending.par_clauses);
+	      break;
+
+	    case OMP_CLAUSE_MAP:
+	      Add_OpenMP_Map_Clauses (expr,
+				      &ada_omp_pending.target_clauses);
+	      break;
+
+	    case OMP_CLAUSE_DEVICE:
+	      {
+		tree clause = build_omp_clause (input_location,
+						OMP_CLAUSE_DEVICE);
+		OMP_CLAUSE_DEVICE_ID (clause) = gnat_to_gnu (expr);
+		Add_OpenMP_Clause (&ada_omp_pending.target_clauses, clause);
+	      }
 	      break;
 
 	    default:
@@ -3919,7 +3969,7 @@ Loop_Statement_to_gnu (Node_Id gnat_node)
 				     top, NULL_TREE);
 	  TREE_SIDE_EFFECTS (target_body) = 1;
 	  OMP_TARGET_BODY (target) = target_body;
-	  OMP_TARGET_CLAUSES (target) = NULL_TREE;
+	  OMP_TARGET_CLAUSES (target) = ada_omp_pending.target_clauses;
 	  gnu_loop_stmt = target;
 	}
       else
