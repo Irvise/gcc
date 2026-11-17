@@ -3841,7 +3841,7 @@ Loop_Statement_to_gnu (Node_Id gnat_node)
 	 global state cannot change the construct being built.  */
       if (omp_loop)
 	{
-	  omp.active = false;
+	  ada_omp_pending.active = false;
 	  omp.active = false;
 	}
       if (omp_loop)
