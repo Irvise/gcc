@@ -49,6 +49,13 @@ GOMP_distribute_static_worksharing (unsigned long long niter
   int __lds *gomp_team_num = (int __lds *) GOMP_TEAM_NUM;
   unsigned tid = *gomp_team_num;
   unsigned nteams = gomp_num_teams_var + 1;
+  /* Defensive: a zero team count would become the divisor of the 64-bit
+     divide in the caller and turn into a ~2^64 loop (GPU hang).  Keep at
+     least one team and a valid team id.  */
+  if (nteams == 0)
+    nteams = 1;
+  if (tid >= nteams)
+    tid = 0;
   return nteams + tid * 1I;
 }
 
@@ -61,6 +68,13 @@ GOMP_distribute_static_worksharing_start (unsigned long long niter
   int __lds *gomp_team_num = (int __lds *) GOMP_TEAM_NUM;
   unsigned tid = *gomp_team_num;
   unsigned nteams = gomp_num_teams_var + 1;
+  /* Defensive: a zero team count would become the divisor of the 64-bit
+     divide in the caller and turn into a ~2^64 loop (GPU hang).  Keep at
+     least one team and a valid team id.  */
+  if (nteams == 0)
+    nteams = 1;
+  if (tid >= nteams)
+    tid = 0;
   return nteams + tid * 1I;
 }
 
