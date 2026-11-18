@@ -348,6 +348,17 @@ struct ptx_device
       pthread_mutex_t lock;
     } omp_stacks;
 
+  /* Cache of small device allocations, to avoid a cuMemAlloc/cuMemFree pair
+     for every target region (target variable table, firstprivate data).  */
+  struct nvptx_mem_cache
+    {
+      void *ptr;
+      size_t size;
+      struct nvptx_mem_cache *next;
+    } *mem_cache;
+  size_t mem_cache_bytes;
+  pthread_mutex_t mem_cache_lock;
+
   struct rev_offload *rev_data;
   struct ptx_device *next;
 };
@@ -621,6 +632,10 @@ nvptx_open_device (int n)
   ptx_dev->omp_stacks.size = 0;
   pthread_mutex_init (&ptx_dev->omp_stacks.lock, NULL);
 
+  ptx_dev->mem_cache = NULL;
+  ptx_dev->mem_cache_bytes = 0;
+  pthread_mutex_init (&ptx_dev->mem_cache_lock, NULL);
+
   ptx_dev->rev_data = NULL;
 
   return ptx_dev;
@@ -652,6 +667,17 @@ nvptx_close_device (struct ptx_device *ptx_dev)
       b = b_next;
     }
 
+  for (struct nvptx_mem_cache *n = ptx_dev->mem_cache; n;)
+    {
+      struct nvptx_mem_cache *n_next = n->next;
+      CUDA_CALL (cuMemFree, (CUdeviceptr) n->ptr);
+      free (n);
+      n = n_next;
+    }
+  ptx_dev->mem_cache = NULL;
+  ptx_dev->mem_cache_bytes = 0;
+
+  pthread_mutex_destroy (&ptx_dev->mem_cache_lock);
   pthread_mutex_destroy (&ptx_dev->free_blocks_lock);
   pthread_mutex_destroy (&ptx_dev->image_lock);
 
@@ -1214,6 +1240,67 @@ goacc_profiling_acc_ev_free (struct goacc_thread *thr, void *p)
   GOMP_PLUGIN_goacc_profiling_dispatch (prof_info, &data_event_info, api_info);
 }
 
+/* Maximum size of a single cached block and of the whole per-device cache.
+   Larger allocations (bulk data buffers) are freed immediately.  */
+#define NVPTX_MEM_CACHE_MAX_BLOCK (64 * 1024)
+#define NVPTX_MEM_CACHE_MAX_TOTAL (4 * 1024 * 1024)
+
+/* Take a cached block of at least SIZE bytes from the device cache, or return
+   NULL.  */
+
+static void *
+nvptx_mem_cache_take (struct ptx_device *ptx_dev, size_t size)
+{
+  void *ret = NULL;
+  pthread_mutex_lock (&ptx_dev->mem_cache_lock);
+  struct nvptx_mem_cache **pp = &ptx_dev->mem_cache;
+  struct nvptx_mem_cache *best = NULL, **best_pp = NULL;
+  for (; *pp; pp = &(*pp)->next)
+    if ((*pp)->size >= size && (best == NULL || (*pp)->size < best->size))
+      {
+	best = *pp;
+	best_pp = pp;
+      }
+  if (best != NULL)
+    {
+      *best_pp = best->next;
+      ptx_dev->mem_cache_bytes -= best->size;
+      ret = best->ptr;
+      free (best);
+    }
+  pthread_mutex_unlock (&ptx_dev->mem_cache_lock);
+  return ret;
+}
+
+/* Put a block into the device cache for later reuse.  Returns false if the
+   block should be freed immediately instead.  */
+
+static bool
+nvptx_mem_cache_put (struct ptx_device *ptx_dev, void *ptr, size_t size)
+{
+  if (size == 0 || size > NVPTX_MEM_CACHE_MAX_BLOCK)
+    return false;
+  struct nvptx_mem_cache *n = GOMP_PLUGIN_malloc (sizeof (*n));
+  if (n == NULL)
+    return false;
+  bool ok = true;
+  pthread_mutex_lock (&ptx_dev->mem_cache_lock);
+  if (ptx_dev->mem_cache_bytes + size > NVPTX_MEM_CACHE_MAX_TOTAL)
+    ok = false;
+  else
+    {
+      n->ptr = ptr;
+      n->size = size;
+      n->next = ptx_dev->mem_cache;
+      ptx_dev->mem_cache = n;
+      ptx_dev->mem_cache_bytes += size;
+    }
+  pthread_mutex_unlock (&ptx_dev->mem_cache_lock);
+  if (!ok)
+    free (n);
+  return ok;
+}
+
 static bool
 nvptx_free (void *p, struct ptx_device *ptx_dev)
 {
@@ -1248,10 +1335,15 @@ nvptx_free (void *p, struct ptx_device *ptx_dev)
       return false;
     }
 
-  CUDA_CALL (cuMemFree, (CUdeviceptr) p);
   struct goacc_thread *thr = GOMP_PLUGIN_goacc_thread ();
   bool profiling_p
     = __builtin_expect (thr != NULL && thr->prof_info != NULL, false);
+  if (!profiling_p
+      && ptx_dev != NULL
+      && nvptx_mem_cache_put (ptx_dev, p, (size_t) ps))
+    return true;
+
+  CUDA_CALL (cuMemFree, (CUdeviceptr) p);
   if (profiling_p)
     goacc_profiling_acc_ev_free (thr, p);
 
@@ -2039,6 +2131,21 @@ cleanup_and_alloc (int ord, size_t size, bool managed)
 void *
 GOMP_OFFLOAD_alloc (int ord, size_t size)
 {
+  struct ptx_device *ptx_dev = ptx_devices[ord];
+  /* Small allocations (target variable table, firstprivate payload) are the
+     common case and are allocated/freed for every target region.  Reuse a
+     cached block instead of calling cuMemAlloc/cuMemFree each time.  */
+  if (size <= NVPTX_MEM_CACHE_MAX_BLOCK && ptx_dev != NULL)
+    {
+      void *cached = nvptx_mem_cache_take (ptx_dev, size);
+      if (cached != NULL)
+	{
+	  struct goacc_thread *thr = GOMP_PLUGIN_goacc_thread ();
+	  if (__builtin_expect (thr != NULL && thr->prof_info != NULL, false))
+	    goacc_profiling_acc_ev_alloc (thr, cached, size);
+	  return cached;
+	}
+    }
   return cleanup_and_alloc (ord, size, false);
 }
 
